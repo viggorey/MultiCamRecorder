@@ -1,0 +1,36 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="TIS.Imaging.ICImagingControl35">
+      <HintPath>C:\Program Files (x86)\The Imaging Source Europe GmbH\IC Imaging Control 3.5 .NET Library\bin\x64\TIS.Imaging.ICImagingControl35.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenCvSharp4" Version="4.11.0.20250507" />
+    <PackageReference Include="OpenCvSharp4.Extensions" Version="4.11.0.20250507" />
+    <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.11.0.20250507" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Microsoft.VisualBasic">
+        <HintPath>C:\Program Files\dotnet\shared\Microsoft.NETCore.App\8.0.0\Microsoft.VisualBasic.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Microsoft.VisualBasic">
+        <HintPath>$(MSBuildProgramFiles)\dotnet\shared\Microsoft.NETCore.App\8.0.0\Microsoft.VisualBasic.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
