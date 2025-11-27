@@ -240,6 +240,12 @@ namespace MultiCamRecorder
         private const int CAMERA_SPACING = 10;
         private const int TOP_MARGIN = 145; // Increased for menu + buttons + working folder
         private const int SIDE_MARGIN = 10;
+        private readonly float dpiScale;
+        
+        private int ScaleValue(int value) => (int)Math.Round(value * dpiScale);
+        private System.Drawing.Point ScalePoint(int x, int y) => new System.Drawing.Point(ScaleValue(x), ScaleValue(y));
+        private System.Drawing.Size ScaleSize(int width, int height) => new System.Drawing.Size(ScaleValue(width), ScaleValue(height));
+        private System.Drawing.Size ScaleSize(System.Drawing.Size size) => ScaleSize(size.Width, size.Height);
         private int expandedCameraIndex = -1;
         private int currentPreviewWidth = 320;
         private int currentPreviewHeight = 240;
@@ -254,12 +260,22 @@ namespace MultiCamRecorder
         public Form1()
         {
             InitializeComponent();
+            dpiScale = this.DeviceDpi / 96f;
             this.Resize += (s, e) =>
             {
                 if (expandedCameraIndex >= 0)
                 {
                     UpdateExpandedLayout();
                 }
+            };
+            this.Shown += (s, e) =>
+            {
+                // Ensure window is centered after it's shown
+                this.StartPosition = FormStartPosition.Manual;
+                this.Location = new System.Drawing.Point(
+                    (Screen.PrimaryScreen.WorkingArea.Width - this.Width) / 2,
+                    (Screen.PrimaryScreen.WorkingArea.Height - this.Height) / 2
+                );
             };
             settings = UserSettings.Load();
             systemInfo = new SystemInfo();  // ← ADD THIS LINE
@@ -567,7 +583,9 @@ namespace MultiCamRecorder
         private void SetupMainWindow()
         {
             this.Text = "Multi-Camera Recorder";
-            this.Size = new System.Drawing.Size(1400, 485);
+            this.MinimumSize = ScaleSize(800, 400);
+            this.Size = ScaleSize(1400, 485);
+            this.StartPosition = FormStartPosition.CenterScreen;
             this.AutoScroll = true;
 
             // Create control buttons at the top (below menu bar)
@@ -579,8 +597,8 @@ namespace MultiCamRecorder
             btnRefreshCameras = new Button
             {
                 Text = "Refresh Cameras",
-                Location = new System.Drawing.Point(buttonX, buttonY),
-                Size = new System.Drawing.Size(buttonWidth, 30)
+                Location = ScalePoint(buttonX, buttonY),
+                Size = ScaleSize(buttonWidth, 30)
             };
             btnRefreshCameras.Click += BtnRefreshCameras_Click;
             this.Controls.Add(btnRefreshCameras);
@@ -588,8 +606,8 @@ namespace MultiCamRecorder
             btnStartLive = new Button
             {
                 Text = "Start All Live",
-                Location = new System.Drawing.Point(buttonX + buttonSpacing, buttonY),
-                Size = new System.Drawing.Size(buttonWidth, 30),
+                Location = ScalePoint(buttonX + buttonSpacing, buttonY),
+                Size = ScaleSize(buttonWidth, 30),
                 Enabled = false
             };
             btnStartLive.Click += BtnStartLive_Click;
@@ -598,8 +616,8 @@ namespace MultiCamRecorder
             btnStopLive = new Button
             {
                 Text = "Stop All Live",
-                Location = new System.Drawing.Point(buttonX + buttonSpacing * 2, buttonY),
-                Size = new System.Drawing.Size(buttonWidth, 30),
+                Location = ScalePoint(buttonX + buttonSpacing * 2, buttonY),
+                Size = ScaleSize(buttonWidth, 30),
                 Enabled = false
             };
             btnStopLive.Click += BtnStopLive_Click;
@@ -608,8 +626,8 @@ namespace MultiCamRecorder
             btnStartRecording = new Button
             {
                 Text = "Start Recording",
-                Location = new System.Drawing.Point(buttonX + buttonSpacing * 3, buttonY),
-                Size = new System.Drawing.Size(buttonWidth, 30),
+                Location = ScalePoint(buttonX + buttonSpacing * 3, buttonY),
+                Size = ScaleSize(buttonWidth, 30),
                 Enabled = false
             };
             btnStartRecording.Click += BtnStartRecording_Click;
@@ -618,8 +636,8 @@ namespace MultiCamRecorder
             btnStopRecording = new Button
             {
                 Text = "Stop Recording",
-                Location = new System.Drawing.Point(buttonX + buttonSpacing * 4, buttonY),
-                Size = new System.Drawing.Size(buttonWidth, 30),
+                Location = ScalePoint(buttonX + buttonSpacing * 4, buttonY),
+                Size = ScaleSize(buttonWidth, 30),
                 Enabled = false
             };
             btnStopRecording.Click += BtnStopRecording_Click;
@@ -629,8 +647,8 @@ namespace MultiCamRecorder
             Button btnManageCameras = new Button
             {
                 Text = "Manage Cameras",
-                Location = new System.Drawing.Point(buttonX + buttonSpacing * 5, buttonY),
-                Size = new System.Drawing.Size(buttonWidth, 30)
+                Location = ScalePoint(buttonX + buttonSpacing * 5, buttonY),
+                Size = ScaleSize(buttonWidth, 30)
             };
             btnManageCameras.Click += BtnManageCameras_Click;
             this.Controls.Add(btnManageCameras);
@@ -639,8 +657,8 @@ namespace MultiCamRecorder
             btnScreenshot = new Button  // ← Changed from "Button btnScreenshot" to "btnScreenshot"
             {
                 Text = "📷 Screenshot",
-                Location = new System.Drawing.Point(buttonX + buttonSpacing * 6, buttonY),
-                Size = new System.Drawing.Size(buttonWidth, 30),
+                Location = ScalePoint(buttonX + buttonSpacing * 6, buttonY),
+                Size = ScaleSize(buttonWidth, 30),
                 Enabled = false
             };
             btnScreenshot.Click += BtnScreenshot_Click;
@@ -652,16 +670,16 @@ namespace MultiCamRecorder
             lblWorkingFolder = new Label
             {
                 Text = "Working Folder:",
-                Location = new System.Drawing.Point(buttonX, folderY + 5),
-                Size = new System.Drawing.Size(100, 20),
+                Location = ScalePoint(buttonX, folderY + 5),
+                Size = ScaleSize(100, 20),
                 Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
             };
             this.Controls.Add(lblWorkingFolder);
             
             txtWorkingFolder = new TextBox
             {
-                Location = new System.Drawing.Point(buttonX + 105, folderY),
-                Size = new System.Drawing.Size(400, 25),
+                Location = ScalePoint(buttonX + 105, folderY),
+                Size = ScaleSize(400, 25),
                 Text = string.IsNullOrEmpty(settings.WorkingFolder) ? @"C:\CameraRecordings" : settings.WorkingFolder,
                 ReadOnly = true
             };
@@ -670,8 +688,8 @@ namespace MultiCamRecorder
             btnBrowseWorkingFolder = new Button
             {
                 Text = "📁",
-                Location = new System.Drawing.Point(buttonX + 510, folderY - 2),
-                Size = new System.Drawing.Size(35, 28),
+                Location = ScalePoint(buttonX + 510, folderY - 2),
+                Size = ScaleSize(35, 28),
                 Font = new System.Drawing.Font("Segoe UI", 10)
             };
             btnBrowseWorkingFolder.Click += BtnBrowseWorkingFolder_Click;
@@ -683,16 +701,16 @@ namespace MultiCamRecorder
             Label lblRecordingMode = new Label
             {
                 Text = "Recording Mode:",
-                Location = new System.Drawing.Point(buttonX, loopY + 4),
-                Size = new System.Drawing.Size(110, 20),
+                Location = ScalePoint(buttonX, loopY + 4),
+                Size = ScaleSize(110, 20),
                 Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
             };
             this.Controls.Add(lblRecordingMode);
 
             ComboBox cmbRecordingMode = new ComboBox
             {
-                Location = new System.Drawing.Point(buttonX + 115, loopY),
-                Size = new System.Drawing.Size(140, 25),
+                Location = ScalePoint(buttonX + 115, loopY),
+                Size = ScaleSize(140, 25),
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Font = new System.Drawing.Font("Arial", 9)
             };
@@ -761,8 +779,8 @@ namespace MultiCamRecorder
             lblLoopDuration = new Label
             {
                 Text = "Duration (sec):",
-                Location = new System.Drawing.Point(buttonX + 265, loopY + 4),
-                Size = new System.Drawing.Size(90, 20),
+                Location = ScalePoint(buttonX + 265, loopY + 4),
+                Size = ScaleSize(90, 20),
                 Font = new System.Drawing.Font("Arial", 8),
                 Visible = false
             };
@@ -770,8 +788,8 @@ namespace MultiCamRecorder
 
             numLoopDuration = new NumericUpDown
             {
-                Location = new System.Drawing.Point(buttonX + 360, loopY),
-                Size = new System.Drawing.Size(60, 25),
+                Location = ScalePoint(buttonX + 360, loopY),
+                Size = ScaleSize(60, 25),
                 Minimum = 2,
                 Maximum = 60,
                 Value = 10,
@@ -782,8 +800,8 @@ namespace MultiCamRecorder
             chkLoopRecording = new CheckBox
             {
                 Text = "Loop Recording",
-                Location = new System.Drawing.Point(buttonX + 130, loopY),
-                Size = new System.Drawing.Size(120, 25),
+                Location = ScalePoint(buttonX + 130, loopY),
+                Size = ScaleSize(120, 25),
                 Checked = false,
                 Visible = false
             };
@@ -793,8 +811,8 @@ namespace MultiCamRecorder
             Label lblTimelapseInterval = new Label
             {
                 Text = "Frame every:",
-                Location = new System.Drawing.Point(buttonX + 265, loopY + 4),
-                Size = new System.Drawing.Size(80, 20),
+                Location = ScalePoint(buttonX + 265, loopY + 4),
+                Size = ScaleSize(80, 20),
                 Font = new System.Drawing.Font("Arial", 8),
                 Visible = false,
                 Tag = "timelapse"
@@ -803,8 +821,8 @@ namespace MultiCamRecorder
 
             numTimelapseHours = new NumericUpDown
             {
-                Location = new System.Drawing.Point(buttonX + 350, loopY),
-                Size = new System.Drawing.Size(50, 25),
+                Location = ScalePoint(buttonX + 350, loopY),
+                Size = ScaleSize(50, 25),
                 Minimum = 0,
                 Maximum = 23,
                 Value = 0,
@@ -816,8 +834,8 @@ namespace MultiCamRecorder
             Label lblHours = new Label
             {
                 Text = "h",
-                Location = new System.Drawing.Point(buttonX + 405, loopY + 4),
-                Size = new System.Drawing.Size(15, 20),
+                Location = ScalePoint(buttonX + 405, loopY + 4),
+                Size = ScaleSize(15, 20),
                 Font = new System.Drawing.Font("Arial", 8),
                 Visible = false,
                 Tag = "timelapse"
@@ -826,8 +844,8 @@ namespace MultiCamRecorder
 
             numTimelapseMinutes = new NumericUpDown
             {
-                Location = new System.Drawing.Point(buttonX + 425, loopY),
-                Size = new System.Drawing.Size(50, 25),
+                Location = ScalePoint(buttonX + 425, loopY),
+                Size = ScaleSize(50, 25),
                 Minimum = 0,
                 Maximum = 59,
                 Value = 1,
@@ -839,8 +857,8 @@ namespace MultiCamRecorder
             Label lblMinutes = new Label
             {
                 Text = "m",
-                Location = new System.Drawing.Point(buttonX + 480, loopY + 4),
-                Size = new System.Drawing.Size(15, 20),
+                Location = ScalePoint(buttonX + 480, loopY + 4),
+                Size = ScaleSize(15, 20),
                 Font = new System.Drawing.Font("Arial", 8),
                 Visible = false,
                 Tag = "timelapse"
@@ -849,8 +867,8 @@ namespace MultiCamRecorder
 
             numTimelapseSeconds = new NumericUpDown
             {
-                Location = new System.Drawing.Point(buttonX + 500, loopY),
-                Size = new System.Drawing.Size(50, 25),
+                Location = ScalePoint(buttonX + 500, loopY),
+                Size = ScaleSize(50, 25),
                 Minimum = 0,
                 Maximum = 59,
                 Value = 0,
@@ -862,8 +880,8 @@ namespace MultiCamRecorder
             Label lblSeconds = new Label
             {
                 Text = "s",
-                Location = new System.Drawing.Point(buttonX + 555, loopY + 4),
-                Size = new System.Drawing.Size(15, 20),
+                Location = ScalePoint(buttonX + 555, loopY + 4),
+                Size = ScaleSize(15, 20),
                 Font = new System.Drawing.Font("Arial", 8),
                 Visible = false,
                 Tag = "timelapse"
@@ -873,8 +891,8 @@ namespace MultiCamRecorder
             lblExternalFps = new Label
             {
                 Text = "Expected FPS:",
-                Location = new System.Drawing.Point(buttonX + 290, loopY + 4),
-                Size = new System.Drawing.Size(100, 20),
+                Location = ScalePoint(buttonX + 290, loopY + 4),
+                Size = ScaleSize(100, 20),
                 Font = new System.Drawing.Font("Arial", 8),
                 Visible = false  // ← ADD THIS LINE
             };
@@ -882,8 +900,8 @@ namespace MultiCamRecorder
 
             numExternalTriggerFps = new NumericUpDown
             {
-                Location = new System.Drawing.Point(buttonX + 395, loopY),
-                Size = new System.Drawing.Size(60, 25),
+                Location = ScalePoint(buttonX + 395, loopY),
+                Size = ScaleSize(60, 25),
                 Minimum = 1,
                 Maximum = 240,
                 DecimalPlaces = 1,
@@ -897,8 +915,8 @@ namespace MultiCamRecorder
             chkMaxDuration = new CheckBox
             {
                 Text = "Max Duration:",
-                Location = new System.Drawing.Point(buttonX + 600, loopY + 2),
-                Size = new System.Drawing.Size(110, 20),
+                Location = ScalePoint(buttonX + 600, loopY + 2),
+                Size = ScaleSize(110, 20),
                 Font = new System.Drawing.Font("Arial", 8),
                 Visible = false  // Hidden until recording mode selected
             };
@@ -906,8 +924,8 @@ namespace MultiCamRecorder
 
             numMaxMinutes = new NumericUpDown
             {
-                Location = new System.Drawing.Point(buttonX + 715, loopY),
-                Size = new System.Drawing.Size(70, 25),
+                Location = ScalePoint(buttonX + 715, loopY),
+                Size = ScaleSize(70, 25),
                 Minimum = 1,
                 Maximum = 525600, // 365 days in minutes
                 Value = 60,
@@ -918,8 +936,8 @@ namespace MultiCamRecorder
 
             cmbMaxDurationUnit = new ComboBox
             {
-                Location = new System.Drawing.Point(buttonX + 790, loopY),
-                Size = new System.Drawing.Size(70, 25),
+                Location = ScalePoint(buttonX + 790, loopY),
+                Size = ScaleSize(70, 25),
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Enabled = false,
                 Visible = false
@@ -946,16 +964,16 @@ namespace MultiCamRecorder
             Label lblLayout = new Label
             {
                 Text = "Preview Size:",
-                Location = new System.Drawing.Point(buttonX + 870, loopY + 4),
-                Size = new System.Drawing.Size(85, 20),
+                Location = ScalePoint(buttonX + 870, loopY + 4),
+                Size = ScaleSize(85, 20),
                 Font = new System.Drawing.Font("Arial", 8)
             };
             this.Controls.Add(lblLayout);
 
             cmbPreviewSize = new ComboBox
             {
-                Location = new System.Drawing.Point(buttonX + 960, loopY),
-                Size = new System.Drawing.Size(100, 25),
+                Location = ScalePoint(buttonX + 960, loopY),
+                Size = ScaleSize(100, 25),
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Font = new System.Drawing.Font("Arial", 8)
             };
@@ -973,16 +991,16 @@ namespace MultiCamRecorder
             Label lblLayoutMode = new Label
             {
                 Text = "Layout:",
-                Location = new System.Drawing.Point(buttonX + 1070, loopY + 4),
-                Size = new System.Drawing.Size(45, 20),
+                Location = ScalePoint(buttonX + 1070, loopY + 4),
+                Size = ScaleSize(45, 20),
                 Font = new System.Drawing.Font("Arial", 8)
             };
             this.Controls.Add(lblLayoutMode);
 
             cmbLayoutMode = new ComboBox
             {
-                Location = new System.Drawing.Point(buttonX + 1120, loopY),
-                Size = new System.Drawing.Size(90, 25),
+                Location = ScalePoint(buttonX + 1120, loopY),
+                Size = ScaleSize(90, 25),
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Font = new System.Drawing.Font("Arial", 8)
             };
@@ -1001,8 +1019,8 @@ namespace MultiCamRecorder
             lblRamEstimate = new Label
             {
                 Text = "Est. RAM: 0 MB",
-                Location = new System.Drawing.Point(buttonX + 465, loopY + 4),
-                Size = new System.Drawing.Size(150, 20),
+                Location = ScalePoint(buttonX + 465, loopY + 4),
+                Size = ScaleSize(150, 20),
                 Font = new System.Drawing.Font("Arial", 8),
                 ForeColor = System.Drawing.Color.Blue,
                 Visible = false  // ← ADD THIS LINE

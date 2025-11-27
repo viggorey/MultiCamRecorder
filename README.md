@@ -56,6 +56,9 @@ Configure individual camera settings through the camera settings dialog accessib
 ## Building from Source
 
 ```bash
+# Navigate to the project folder (if you cloned the repo, it's in MultiCamRecorder subfolder)
+cd MultiCamRecorder
+
 # Restore NuGet packages
 dotnet restore
 
@@ -64,6 +67,12 @@ dotnet build
 
 # Run the application
 dotnet run
+```
+
+**Note**: If you're in a folder with multiple projects, specify the project file:
+```bash
+dotnet build MultiCamRecorder.csproj
+dotnet run --project MultiCamRecorder.csproj
 ```
 
 ## Project Structure
