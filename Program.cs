@@ -1,4 +1,4 @@
-namespace MultiCamRecorder;
+namespace QueenPix;
 
 static class Program
 {

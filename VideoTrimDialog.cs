@@ -6,7 +6,7 @@ using System.Linq;
 using System.Windows.Forms;
 using OpenCvSharp;
 
-namespace MultiCamRecorder
+namespace QueenPix
 {
     public class VideoTrimDialog : Form
     {

@@ -26,6 +26,24 @@ bld/
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
+[Pp]ublish/
+
+# Lab distribution folder
+[Ll]ab_Distribution/
+MultiCamRecorder_Lab_*.zip
+
+# Installers folder (may contain large installers)
+[Ii]nstallers/
+
+# Tools folder (may contain large binaries like ffmpeg.exe)
+# Large binaries should not be committed to git
+tools/ffmpeg.exe
+tools/ffplay.exe
+tools/ffprobe.exe
+
+# QueenPix folder (contains large executables)
+QueenPix/
+QueenPix_Lab_*.zip
 
 # Visual Studio cache/options directory
 .vs/

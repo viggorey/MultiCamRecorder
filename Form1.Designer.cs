@@ -1,4 +1,4 @@
-﻿namespace MultiCamRecorder;
+﻿namespace QueenPix;
 
 partial class Form1
 {

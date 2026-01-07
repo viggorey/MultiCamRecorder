@@ -3,7 +3,7 @@ using System.Windows.Forms;
 using TIS.Imaging;
 using System.Linq;
 
-namespace MultiCamRecorder
+namespace QueenPix
 {
     public class CameraSettingsDialog : Form
     {
@@ -16,16 +16,23 @@ namespace MultiCamRecorder
         private Label lblFpsRange; 
         private RadioButton rbExternalTrigger;
         private RadioButton rbSoftwareControlled;
+        private CheckBox chkShowDate;
+        private CheckBox chkShowTime;
+        private CheckBox chkShowMilliseconds;
+        private CheckBox chkGenerateJsonTimestamps;
         private int cameraNumber = 0;
+        private string recordingMode = "";
         public CameraSettings Settings { get; private set; }
         public bool SaveAsDefault { get; private set; }
+        public bool ApplyToAllCameras { get; private set; }
         
-        public CameraSettingsDialog(ICImagingControl control, CameraSettings currentSettings, int cameraNum)
+        public CameraSettingsDialog(ICImagingControl control, CameraSettings currentSettings, int cameraNum, string currentRecordingMode = "")
         {
             imagingControl = control;
             settings = currentSettings.Clone();
             Settings = settings;
             cameraNumber = cameraNum;
+            recordingMode = currentRecordingMode;
             
             InitializeDialog();
         }
@@ -33,7 +40,7 @@ namespace MultiCamRecorder
         private void InitializeDialog()
         {
             this.Text = $"Camera {cameraNumber}: {imagingControl.Device} Settings";
-            this.Size = new System.Drawing.Size(500, 340);
+            this.Size = new System.Drawing.Size(550, 620);
             this.StartPosition = FormStartPosition.CenterParent;
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
@@ -139,7 +146,117 @@ namespace MultiCamRecorder
                 Font = new System.Drawing.Font("Arial", 8)
             };
             this.Controls.Add(lblTriggerNote);
+            y += 35;
+            
+            // Date/Time Overlay Section
+            Label lblOverlay = new Label
+            {
+                Text = "Date/Time Overlay:",
+                Location = new System.Drawing.Point(leftMargin, y),
+                Size = new System.Drawing.Size(labelWidth, 20),
+                Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
+            };
+            this.Controls.Add(lblOverlay);
+            y += 25;
+            
+            chkShowDate = new CheckBox
+            {
+                Text = "Show Date (YYYY-MM-DD)",
+                Location = new System.Drawing.Point(leftMargin + labelWidth, y),
+                Size = new System.Drawing.Size(200, 20),
+                Checked = settings.ShowDate
+            };
+            this.Controls.Add(chkShowDate);
+            y += 25;
+            
+            chkShowTime = new CheckBox
+            {
+                Text = "Show Time (HH:MM:SS)",
+                Location = new System.Drawing.Point(leftMargin + labelWidth, y),
+                Size = new System.Drawing.Size(200, 20),
+                Checked = settings.ShowTime
+            };
+            chkShowTime.CheckedChanged += (s, e) => chkShowMilliseconds.Enabled = chkShowTime.Checked;
+            this.Controls.Add(chkShowTime);
+            y += 25;
+            
+            chkShowMilliseconds = new CheckBox
+            {
+                Text = "Include Milliseconds",
+                Location = new System.Drawing.Point(leftMargin + labelWidth + 20, y),
+                Size = new System.Drawing.Size(180, 20),
+                Checked = settings.ShowMilliseconds,
+                Enabled = settings.ShowTime
+            };
+            this.Controls.Add(chkShowMilliseconds);
             y += 30;
+            
+            // Disable date/time overlay options if Normal Recording mode
+            bool isNormalRecording = recordingMode.Equals("Normal Recording", StringComparison.OrdinalIgnoreCase);
+            if (isNormalRecording)
+            {
+                chkShowDate.Enabled = false;
+                chkShowTime.Enabled = false;
+                chkShowMilliseconds.Enabled = false;
+                
+                Label lblOverlayNote = new Label
+                {
+                    Text = "⚠️ Date/Time overlay is not available in Normal Recording mode",
+                    Location = new System.Drawing.Point(leftMargin + labelWidth, y),
+                    Size = new System.Drawing.Size(340, 30),
+                    ForeColor = System.Drawing.Color.Orange,
+                    Font = new System.Drawing.Font("Arial", 8)
+                };
+                this.Controls.Add(lblOverlayNote);
+                y += 30; // Add extra space for the warning message
+            }
+            else
+            {
+                y += 5; // Small spacing when no warning
+            }
+            
+            // JSON Timestamp File Generation Section
+            Label lblJsonTimestamps = new Label
+            {
+                Text = "JSON Timestamp Files:",
+                Location = new System.Drawing.Point(leftMargin, y),
+                Size = new System.Drawing.Size(labelWidth, 20),
+                Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
+            };
+            this.Controls.Add(lblJsonTimestamps);
+            y += 25;
+            
+            chkGenerateJsonTimestamps = new CheckBox
+            {
+                Text = "Generate JSON timestamp files (one per video)",
+                Location = new System.Drawing.Point(leftMargin + labelWidth, y),
+                Size = new System.Drawing.Size(340, 20),
+                Checked = settings.GenerateJsonTimestamps
+            };
+            this.Controls.Add(chkGenerateJsonTimestamps);
+            y += 30;
+            
+            Label lblJsonNote = new Label
+            {
+                Text = "ℹ️ JSON files contain frame-by-frame timestamps and metadata",
+                Location = new System.Drawing.Point(leftMargin + labelWidth, y - 5),
+                Size = new System.Drawing.Size(340, 20),
+                ForeColor = System.Drawing.Color.Gray,
+                Font = new System.Drawing.Font("Arial", 8)
+            };
+            this.Controls.Add(lblJsonNote);
+            y += 20;
+            
+            Label lblJsonWarning = new Label
+            {
+                Text = "⚠️ Note: JSON files are only generated when saving as AVI format",
+                Location = new System.Drawing.Point(leftMargin + labelWidth, y - 5),
+                Size = new System.Drawing.Size(340, 30),
+                ForeColor = System.Drawing.Color.Orange,
+                Font = new System.Drawing.Font("Arial", 8)
+            };
+            this.Controls.Add(lblJsonWarning);
+            y += 35;
             
             // Populate format dropdown
             if (imagingControl.VideoFormats != null)
@@ -156,7 +273,7 @@ namespace MultiCamRecorder
                     cmbFormat.SelectedIndex = idx;
             }
             
-            y += 10;
+            y += 15;
             
             // Camera Properties button (uses SDK's built-in dialog)
             Label lblProperties = new Label
@@ -186,29 +303,44 @@ namespace MultiCamRecorder
                 Font = new System.Drawing.Font("Arial", 8)
             };
             this.Controls.Add(lblNote);
-            y += 40;
+            y += 50;
             
-            // Buttons
-            Button btnCancel = new Button
-            {
-                Text = "Cancel",
-                Location = new System.Drawing.Point(290, y),
-                Size = new System.Drawing.Size(85, 32),
-                Font = new System.Drawing.Font("Arial", 9),
-                DialogResult = DialogResult.Cancel
-            };
-            this.Controls.Add(btnCancel);
-
+            // Buttons (aligned to the right)
+            int buttonSpacing = 10;
+            int buttonWidth = 85;
+            int buttonWidthAll = 140;
+            int rightMargin = 20;
+            
             Button btnApply = new Button
             {
                 Text = "Save",
-                Location = new System.Drawing.Point(385, y),
-                Size = new System.Drawing.Size(85, 32),
+                Location = new System.Drawing.Point(550 - rightMargin - buttonWidth, y),
+                Size = new System.Drawing.Size(buttonWidth, 32),
                 Font = new System.Drawing.Font("Arial", 9),
                 DialogResult = DialogResult.OK
             };
             btnApply.Click += BtnApply_Click;
             this.Controls.Add(btnApply);
+
+            Button btnApplyToAll = new Button
+            {
+                Text = "Save for All Cameras",
+                Location = new System.Drawing.Point(550 - rightMargin - buttonWidth - buttonSpacing - buttonWidthAll, y),
+                Size = new System.Drawing.Size(buttonWidthAll, 32),
+                Font = new System.Drawing.Font("Arial", 9)
+            };
+            btnApplyToAll.Click += BtnApplyToAll_Click;
+            this.Controls.Add(btnApplyToAll);
+
+            Button btnCancel = new Button
+            {
+                Text = "Cancel",
+                Location = new System.Drawing.Point(550 - rightMargin - buttonWidth - buttonSpacing - buttonWidthAll - buttonSpacing - buttonWidth, y),
+                Size = new System.Drawing.Size(buttonWidth, 32),
+                Font = new System.Drawing.Font("Arial", 9),
+                DialogResult = DialogResult.Cancel
+            };
+            this.Controls.Add(btnCancel);
 
             this.AcceptButton = btnApply;
             this.CancelButton = btnCancel;
@@ -338,7 +470,7 @@ namespace MultiCamRecorder
         }
         
         
-        private void BtnApply_Click(object? sender, EventArgs e)
+        private void SaveSettings()
         {
             SaveAsDefault = true;  // Always save as default now
             
@@ -359,6 +491,25 @@ namespace MultiCamRecorder
                 settings.SoftwareFrameRate = finalFps;
             }
             
+            // Save date/time overlay settings (only if not Normal Recording mode)
+            bool isNormalRecording = recordingMode.Equals("Normal Recording", StringComparison.OrdinalIgnoreCase);
+            if (!isNormalRecording)
+            {
+                settings.ShowDate = chkShowDate.Checked;
+                settings.ShowTime = chkShowTime.Checked;
+                settings.ShowMilliseconds = chkShowMilliseconds.Checked && chkShowTime.Checked;
+            }
+            else
+            {
+                // Force disable overlay in Normal Recording mode
+                settings.ShowDate = false;
+                settings.ShowTime = false;
+                settings.ShowMilliseconds = false;
+            }
+            
+            // Save JSON timestamp file generation setting
+            settings.GenerateJsonTimestamps = chkGenerateJsonTimestamps.Checked;
+            
             // Save VCD properties as XML string
             try
             {
@@ -370,6 +521,20 @@ namespace MultiCamRecorder
             catch { }
             
             Settings = settings;
+        }
+
+        private void BtnApply_Click(object? sender, EventArgs e)
+        {
+            ApplyToAllCameras = false;
+            SaveSettings();
+        }
+
+        private void BtnApplyToAll_Click(object? sender, EventArgs e)
+        {
+            ApplyToAllCameras = true;
+            SaveSettings();
+            this.DialogResult = DialogResult.OK;
+            this.Close();
         }
     }
 }

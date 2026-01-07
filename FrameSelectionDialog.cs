@@ -5,7 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Windows.Forms;
 
-namespace MultiCamRecorder
+namespace QueenPix
 {
     public class FrameSelectionDialog : Form
     {

@@ -4,7 +4,7 @@ using System.IO;
 using System.Windows.Forms;
 using OpenCvSharp;
 
-namespace MultiCamRecorder
+namespace QueenPix
 {
     // Camera preview control with video scrubbing
     public class CameraPreviewControl : UserControl

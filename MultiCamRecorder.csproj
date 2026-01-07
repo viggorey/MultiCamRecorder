@@ -7,11 +7,25 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>QueenPix</AssemblyName>
+    <RootNamespace>QueenPix</RootNamespace>
+    <!-- Application icon -->
+    <ApplicationIcon Condition="Exists('icon.ico')">icon.ico</ApplicationIcon>
+    <!-- Publish settings for self-contained single-file -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>
     <Reference Include="TIS.Imaging.ICImagingControl35">
-      <HintPath>C:\Program Files (x86)\The Imaging Source Europe GmbH\IC Imaging Control 3.5 .NET Library\bin\x64\TIS.Imaging.ICImagingControl35.dll</HintPath>
+      <!-- Use local libs folder (required for building) -->
+      <!-- DLLs are bundled into the final .exe during publish -->
+      <HintPath>libs\TIS.Imaging.ICImagingControl35.dll</HintPath>
+      <Private>true</Private>
+      <CopyLocal>true</CopyLocal>
     </Reference>
   </ItemGroup>
 
@@ -20,6 +34,50 @@
     <PackageReference Include="OpenCvSharp4" Version="4.11.0.20250507" />
     <PackageReference Include="OpenCvSharp4.Extensions" Version="4.11.0.20250507" />
     <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.11.0.20250507" />
+  </ItemGroup>
+
+  <!-- Ensure native DLLs are included in publish output -->
+  <ItemGroup>
+    <Content Include="runtimes\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- Copy TIS.Imaging native dependencies (if they exist in libs folder) -->
+  <ItemGroup>
+    <Content Include="libs\tis_udshl12.dll" Condition="Exists('libs\tis_udshl12.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!-- Visual C++ runtime DLLs (usually already on Windows, but include if needed) -->
+    <Content Include="libs\msvcp140.dll" Condition="Exists('libs\msvcp140.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="libs\msvcp140_1.dll" Condition="Exists('libs\msvcp140_1.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="libs\vcruntime140.dll" Condition="Exists('libs\vcruntime140.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="libs\vcruntime140_1.dll" Condition="Exists('libs\vcruntime140_1.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!-- Copy FFmpeg executables to output directory (optional - only if they exist) -->
+  <ItemGroup>
+    <Content Include="tools\ffmpeg.exe" Condition="Exists('tools\ffmpeg.exe')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>ffmpeg.exe</Link>
+    </Content>
+    <Content Include="tools\ffprobe.exe" Condition="Exists('tools\ffprobe.exe')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>ffprobe.exe</Link>
+    </Content>
+  </ItemGroup>
+
+  <!-- Copy icon.ico to output directory for splash screen (development) -->
+  <ItemGroup>
+    <Content Include="icon.ico" Condition="Exists('icon.ico')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
 </Project>

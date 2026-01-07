@@ -1,6 +1,6 @@
 using System;
 
-namespace MultiCamRecorder
+namespace QueenPix
 {
     /// <summary>
     /// Stores settings for a single camera
@@ -13,7 +13,15 @@ namespace MultiCamRecorder
         // Store all VCD properties (exposure, gain, gamma, white balance, etc.) as XML
         public string VCDPropertiesXml { get; set; } = "";
         public float SoftwareFrameRate { get; set; } = 30.0f; 
-        public bool UseExternalTrigger { get; set; } = false; 
+        public bool UseExternalTrigger { get; set; } = false;
+        
+        // Date/Time overlay settings
+        public bool ShowDate { get; set; } = false;
+        public bool ShowTime { get; set; } = false;
+        public bool ShowMilliseconds { get; set; } = false;
+        
+        // JSON timestamp file generation
+        public bool GenerateJsonTimestamps { get; set; } = true; // Default to enabled 
         public CameraSettings()
         {
         }
@@ -34,7 +42,11 @@ namespace MultiCamRecorder
                 Format = this.Format,
                 VCDPropertiesXml = this.VCDPropertiesXml,
                 SoftwareFrameRate = this.SoftwareFrameRate,
-                UseExternalTrigger = this.UseExternalTrigger
+                UseExternalTrigger = this.UseExternalTrigger,
+                ShowDate = this.ShowDate,
+                ShowTime = this.ShowTime,
+                ShowMilliseconds = this.ShowMilliseconds,
+                GenerateJsonTimestamps = this.GenerateJsonTimestamps
             };
         }
     }

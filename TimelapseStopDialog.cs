@@ -2,7 +2,7 @@ using System;
 using System.Drawing;
 using System.Windows.Forms;
 
-namespace MultiCameraRecorder
+namespace QueenPix
 {
     public class TimelapseStopDialog : Form
     {

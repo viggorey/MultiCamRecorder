@@ -6,12 +6,12 @@ using System.Linq;
 using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
-using OpenCvSharp;  // ← ADD THIS LINE
-using OpenCvSharp.Extensions;  // ← ADD THIS LINE TOO
+using OpenCvSharp;
+using OpenCvSharp.Extensions;
 using System.Runtime.InteropServices;
 
 
-namespace MultiCamRecorder
+namespace QueenPix
 {
     // User settings class for persistent storage
     public class UserSettings
@@ -19,10 +19,21 @@ namespace MultiCamRecorder
         public string WorkingFolder { get; set; } = "";
         public string FfmpegPath { get; set; } = "";
         
+        // Screenshot settings
+        public bool ShowScreenshotSaveDialog { get; set; } = false;
+        
+        // Max duration settings
+        public bool MaxDurationEnabled { get; set; } = false;
+        public int MaxDurationValue { get; set; } = 60;
+        public string MaxDurationUnit { get; set; } = "minutes"; // "minutes", "hours", "days"
+        
+        // Charlotte mode settings
+        public bool CharlotteMode { get; set; } = false;
+        
         public static string GetSettingsPath()
         {
             string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            string appFolder = Path.Combine(appData, "MultiCamRecorder");
+            string appFolder = Path.Combine(appData, "QueenPix");
             Directory.CreateDirectory(appFolder);
             return Path.Combine(appFolder, "settings.json");
         }
@@ -80,7 +91,7 @@ namespace MultiCamRecorder
             public int TotalRecordedFrames { get; set; }
             public DateTime? RecordingStartTime { get; set; }
             public DateTime? RecordingStopTime { get; set; } 
-            public TextBox NameTextBox { get; set; }  // ← ADD THIS LINE
+            public TextBox NameTextBox { get; set; }
             public string CustomName { get; set; }
             public Queue<System.Drawing.Bitmap>? LoopBuffer { get; set; }
             public int MaxLoopFrames { get; set; }
@@ -112,7 +123,7 @@ namespace MultiCamRecorder
                 RecordingStopTime = null; 
                 SettingsButton = new Button();
                 Settings = new CameraSettings();
-                NameTextBox = new TextBox();           // ← ADD THIS LINE
+                NameTextBox = new TextBox();
                 CustomName = "";    
                 LoopBuffer = null;
                 MaxLoopFrames = 0;
@@ -183,12 +194,7 @@ namespace MultiCamRecorder
         private NumericUpDown numLoopDuration = null!;
         private Label lblExternalFps = null!;
         private NumericUpDown numExternalTriggerFps = null!;
-        private Label lblTimelapseDuration = null!;
-        private Label lblTimelapseOutputFps = null!;
-        private CheckBox chkKeepTimelapseImages = null!;
         private Label lblRamEstimate = null!;
-        private CheckBox chkMaxDuration = null!;
-        private NumericUpDown numMaxMinutes = null!;
         private UserSettings settings = null!;     
         private SystemInfo systemInfo = null!;
         
@@ -197,7 +203,6 @@ namespace MultiCamRecorder
         private string currentRecordingBaseName = ""; // Store the timestamp-based name
         private bool wasLiveBeforeSettings = false;
         private bool isBenchmarkMode = false;
-        private ComboBox cmbMaxDurationUnit = null!;
 
 
         private bool IsOneDrivePath(string path)
@@ -229,7 +234,7 @@ namespace MultiCamRecorder
                     return detectedPath;
                 }
                 
-                // Fallback to default location
+                // Fallback to default location (this will likely fail, but provides a clear error message)
                 return @"C:\Program Files\The Imaging Source Europe GmbH\ffmpeg-8.0-essentials_build\bin\ffmpeg.exe";
             }
         }
@@ -256,6 +261,8 @@ namespace MultiCamRecorder
         // Add near line 160, with other private fields
         private HashSet<string> excludedCameraDevices = new HashSet<string>();
         private long lastTotalBytesWritten = 0;
+        private bool diskSpaceWarningShown = false;
+        private Label lblDiskSpace = null!;
 
         public Form1()
         {
@@ -268,23 +275,19 @@ namespace MultiCamRecorder
                     UpdateExpandedLayout();
                 }
             };
-            this.Shown += (s, e) =>
-            {
-                // Ensure window is centered after it's shown
-                this.StartPosition = FormStartPosition.Manual;
-                this.Location = new System.Drawing.Point(
-                    (Screen.PrimaryScreen.WorkingArea.Width - this.Width) / 2,
-                    (Screen.PrimaryScreen.WorkingArea.Height - this.Height) / 2
-                );
-            };
             settings = UserSettings.Load();
-            systemInfo = new SystemInfo();  // ← ADD THIS LINE
+            systemInfo = new SystemInfo();
             SetupMainWindow();
             SetupMenu();
             SetupFpsTimer();
-            DetectAndSetupCameras();
+            UpdateRecordingButtonColor(); // Apply Charlotte mode setting
+            
+            // Show splash screen and detect cameras (form will be shown after)
+            ShowSplashScreenAndDetectCameras();
+            
+            CheckDiskSpace(); // Initial disk space check
             this.KeyPreview = true;
-            this.KeyDown += Form1_KeyDown; // ← ADD THIS LINE
+            this.KeyDown += Form1_KeyDown;
         }
 
         private void Form1_KeyDown(object? sender, KeyEventArgs e)
@@ -357,29 +360,38 @@ namespace MultiCamRecorder
             toolsMenu.DropDownItems.Add(trimItem);
 
             toolsMenu.DropDownItems.Add(new ToolStripSeparator());
-            ToolStripMenuItem profilesItem = new ToolStripMenuItem("Camera Name Profiles...");
-            profilesItem.Click += (s, e) => ManageCameraProfiles();
-            toolsMenu.DropDownItems.Add(profilesItem);
-
-            toolsMenu.DropDownItems.Add(new ToolStripSeparator());
-            ToolStripMenuItem capacityCalcItem = new ToolStripMenuItem("Capacity Calculator...");
+            ToolStripMenuItem capacityCalcItem = new ToolStripMenuItem("Loop Recording RAM Calculator...");
             capacityCalcItem.Click += (s, e) => ShowCapacityCalculator();
             toolsMenu.DropDownItems.Add(capacityCalcItem);
             ToolStripMenuItem recordingTestItem = new ToolStripMenuItem("Recording Test...");
             recordingTestItem.Click += (s, e) => RunRecordingTest();
             toolsMenu.DropDownItems.Add(recordingTestItem);
-
-            toolsMenu.DropDownItems.Add(new ToolStripSeparator());
-            ToolStripMenuItem ffmpegSettingsItem = new ToolStripMenuItem("FFmpeg Settings...");
-            ffmpegSettingsItem.Click += (s, e) => ConfigureFfmpegPath();
-            toolsMenu.DropDownItems.Add(ffmpegSettingsItem);
+            
+            // Settings menu
+            ToolStripMenuItem settingsMenu = new ToolStripMenuItem("Settings");
+            ToolStripMenuItem preferencesItem = new ToolStripMenuItem("Preferences...");
+            preferencesItem.Click += (s, e) => ShowSettingsDialog();
+            settingsMenu.DropDownItems.Add(preferencesItem);
+            
+            ToolStripMenuItem profilesItem = new ToolStripMenuItem("Camera Name Profiles...");
+            profilesItem.Click += (s, e) => ManageCameraProfiles();
+            settingsMenu.DropDownItems.Add(profilesItem);
+            
+            settingsMenu.DropDownItems.Add(new ToolStripSeparator());
+            ToolStripMenuItem exportSettingsItem = new ToolStripMenuItem("Export Settings...");
+            exportSettingsItem.Click += (s, e) => ExportSettings();
+            settingsMenu.DropDownItems.Add(exportSettingsItem);
+            
+            ToolStripMenuItem importSettingsItem = new ToolStripMenuItem("Import Settings...");
+            importSettingsItem.Click += (s, e) => ImportSettings();
+            settingsMenu.DropDownItems.Add(importSettingsItem);
             
             // Help menu
             ToolStripMenuItem helpMenu = new ToolStripMenuItem("Help");
 
             ToolStripMenuItem aboutItem = new ToolStripMenuItem("About");
             aboutItem.Click += (s, e) => MessageBox.Show(
-                "Multi-Camera Recorder\n\n" +
+                "QueenPix\n\n" +
                 "Version 2.0\n\n" +
                 "Synchronized multi-camera recording with accurate frame rate control.\n\n" +
                 "KEYBOARD SHORTCUTS:\n" +
@@ -393,6 +405,7 @@ namespace MultiCamRecorder
 
             menuStrip.Items.Add(fileMenu);
             menuStrip.Items.Add(toolsMenu);
+            menuStrip.Items.Add(settingsMenu);
             menuStrip.Items.Add(helpMenu);
             
             this.MainMenuStrip = menuStrip;
@@ -400,10 +413,27 @@ namespace MultiCamRecorder
         }
 
         /// <summary>
-        /// Auto-detects FFmpeg path by checking common installation locations and PATH environment variable
+        /// Auto-detects FFmpeg path by checking application directory first, then common installation locations and PATH environment variable
         /// </summary>
         private string? DetectFfmpegPath()
         {
+            // First, check the application directory (for bundled FFmpeg)
+            string appDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            string[] appDirectoryPaths = new[]
+            {
+                Path.Combine(appDirectory, "ffmpeg.exe"),
+                Path.Combine(appDirectory, "ffmpeg", "ffmpeg.exe"),
+                Path.Combine(appDirectory, "bin", "ffmpeg.exe"),
+            };
+
+            foreach (string path in appDirectoryPaths)
+            {
+                if (File.Exists(path))
+                {
+                    return path;
+                }
+            }
+
             // Common installation paths to check
             string[] commonPaths = new[]
             {
@@ -582,11 +612,52 @@ namespace MultiCamRecorder
 
         private void SetupMainWindow()
         {
-            this.Text = "Multi-Camera Recorder";
+            this.Text = "QueenPix";
             this.MinimumSize = ScaleSize(800, 400);
-            this.Size = ScaleSize(1400, 485);
+            
+            // Set application icon - embedded via ApplicationIcon in .csproj
+            // Try to load from embedded resources first, then fallback to file if exists
+            try
+            {
+                var assembly = System.Reflection.Assembly.GetExecutingAssembly();
+                // Try embedded resource (when ApplicationIcon is set, it may be embedded)
+                using (var stream = assembly.GetManifestResourceStream("QueenPix.icon.ico"))
+                {
+                    if (stream != null)
+                    {
+                        this.Icon = new System.Drawing.Icon(stream);
+                    }
+                    else
+                    {
+                        // Fallback: try loading from file (for development)
+                        string iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "icon.ico");
+                        if (File.Exists(iconPath))
+                        {
+                            this.Icon = new System.Drawing.Icon(iconPath);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Icon will use default or embedded icon from ApplicationIcon property
+                // The executable will still have the icon embedded for Windows Explorer/taskbar
+            }
+            
+            // Set initial size, but ensure it fits on screen (width can exceed for scrolling)
+            int screenWidth = Screen.PrimaryScreen.WorkingArea.Width;
+            int screenHeight = Screen.PrimaryScreen.WorkingArea.Height;
+            int initialWidth = ScaleSize(1400, 485).Width;
+            int initialHeight = ScaleSize(1400, 485).Height;
+            
+            // Width can be wider than screen (will scroll), but cap at reasonable max
+            initialWidth = Math.Min(initialWidth, Math.Max(screenWidth, 1400));
+            // Height should fit on screen
+            initialHeight = Math.Min(initialHeight, screenHeight - 50); // Leave 50px margin
+            
+            this.Size = new System.Drawing.Size(initialWidth, initialHeight);
             this.StartPosition = FormStartPosition.CenterScreen;
-            this.AutoScroll = true;
+            this.AutoScroll = true; // Enable horizontal and vertical scrolling
 
             // Create control buttons at the top (below menu bar)
             int buttonY = 30; // Moved down for menu bar
@@ -679,7 +750,7 @@ namespace MultiCamRecorder
             txtWorkingFolder = new TextBox
             {
                 Location = ScalePoint(buttonX + 105, folderY),
-                Size = ScaleSize(400, 25),
+                Size = ScaleSize(280, 25),
                 Text = string.IsNullOrEmpty(settings.WorkingFolder) ? @"C:\CameraRecordings" : settings.WorkingFolder,
                 ReadOnly = true
             };
@@ -688,12 +759,22 @@ namespace MultiCamRecorder
             btnBrowseWorkingFolder = new Button
             {
                 Text = "📁",
-                Location = ScalePoint(buttonX + 510, folderY - 2),
+                Location = ScalePoint(buttonX + 390, folderY - 2),
                 Size = ScaleSize(35, 28),
                 Font = new System.Drawing.Font("Segoe UI", 10)
             };
             btnBrowseWorkingFolder.Click += BtnBrowseWorkingFolder_Click;
             this.Controls.Add(btnBrowseWorkingFolder);
+
+            lblDiskSpace = new Label
+            {
+                Text = "Disk Space: --",
+                Location = ScalePoint(buttonX + 430, folderY + 2),
+                Size = ScaleSize(250, 20),
+                Font = new System.Drawing.Font("Arial", 8),
+                ForeColor = System.Drawing.Color.Gray
+            };
+            this.Controls.Add(lblDiskSpace);
 
             int loopY = folderY + 35;
 
@@ -732,7 +813,7 @@ namespace MultiCamRecorder
                 numLoopDuration.Visible = false;
                 lblExternalFps.Visible = false;
                 numExternalTriggerFps.Visible = false;
-                lblRamEstimate.Visible = false;  // ← ADD THIS
+                lblRamEstimate.Visible = false;
                 
                 // Hide all timelapse controls
                 foreach (Control ctrl in this.Controls)
@@ -743,19 +824,16 @@ namespace MultiCamRecorder
                     }
                 }
                 
-                // Show max duration for all modes
-                chkMaxDuration.Visible = true;
-                numMaxMinutes.Visible = chkMaxDuration.Checked;
-                cmbMaxDurationUnit.Visible = chkMaxDuration.Checked;
-                
                 // Show mode-specific controls
                 if (selectedMode == "Loop Recording")
                 {
                     lblLoopDuration.Visible = true;
                     numLoopDuration.Visible = true;
+                    numLoopDuration.Enabled = true;
                     lblExternalFps.Visible = true;
                     numExternalTriggerFps.Visible = true;
-                    lblRamEstimate.Visible = true;  // ← ADD THIS
+                    numExternalTriggerFps.Enabled = true;  // Enable the control
+                    lblRamEstimate.Visible = true;
                     UpdateRamEstimate();
                 }
                 else if (selectedMode == "Timelapse")
@@ -888,83 +966,47 @@ namespace MultiCamRecorder
             };
             this.Controls.Add(lblSeconds);
 
+            // Expected FPS control - positioned after Duration (sec), on same line
             lblExternalFps = new Label
             {
                 Text = "Expected FPS:",
-                Location = ScalePoint(buttonX + 290, loopY + 4),
-                Size = ScaleSize(100, 20),
+                Location = ScalePoint(buttonX + 430, loopY + 4),
+                Size = ScaleSize(90, 20),
                 Font = new System.Drawing.Font("Arial", 8),
-                Visible = false  // ← ADD THIS LINE
+                Visible = false
             };
             this.Controls.Add(lblExternalFps);
 
             numExternalTriggerFps = new NumericUpDown
             {
-                Location = ScalePoint(buttonX + 395, loopY),
-                Size = ScaleSize(60, 25),
+                Location = ScalePoint(buttonX + 525, loopY),
+                Size = ScaleSize(70, 25),
                 Minimum = 1,
                 Maximum = 240,
                 DecimalPlaces = 1,
                 Value = 30,
                 Enabled = false,
-                Visible = false  // ← ADD THIS LINE
+                Visible = false
             };
             this.Controls.Add(numExternalTriggerFps);
 
-            // ✅ MAX DURATION CONTROLS (after loop controls):
-            chkMaxDuration = new CheckBox
+            // RAM estimate label (visible in Loop Recording mode)
+            lblRamEstimate = new Label
             {
-                Text = "Max Duration:",
-                Location = ScalePoint(buttonX + 600, loopY + 2),
-                Size = ScaleSize(110, 20),
+                Text = "Est. RAM: 0 MB",
+                Location = ScalePoint(buttonX + 600, loopY + 4),
+                Size = ScaleSize(150, 20),
                 Font = new System.Drawing.Font("Arial", 8),
-                Visible = false  // Hidden until recording mode selected
-            };
-            this.Controls.Add(chkMaxDuration);
-
-            numMaxMinutes = new NumericUpDown
-            {
-                Location = ScalePoint(buttonX + 715, loopY),
-                Size = ScaleSize(70, 25),
-                Minimum = 1,
-                Maximum = 525600, // 365 days in minutes
-                Value = 60,
-                Enabled = false,
+                ForeColor = System.Drawing.Color.Blue,
                 Visible = false
             };
-            this.Controls.Add(numMaxMinutes);
+            this.Controls.Add(lblRamEstimate);
 
-            cmbMaxDurationUnit = new ComboBox
-            {
-                Location = ScalePoint(buttonX + 790, loopY),
-                Size = ScaleSize(70, 25),
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                Enabled = false,
-                Visible = false
-            };
-            cmbMaxDurationUnit.Items.AddRange(new object[] { "minutes", "hours", "days" });
-            cmbMaxDurationUnit.SelectedIndex = 0;
-            this.Controls.Add(cmbMaxDurationUnit);
-
-            chkMaxDuration.CheckedChanged += (s, e) =>
-            {
-                numMaxMinutes.Enabled = chkMaxDuration.Checked;
-                cmbMaxDurationUnit.Enabled = chkMaxDuration.Checked;
-                numMaxMinutes.Visible = chkMaxDuration.Checked;
-                cmbMaxDurationUnit.Visible = chkMaxDuration.Checked;
-            };
-
-            // Store references for later use
-            chkMaxDuration.Tag = "maxDurationCheckbox";
-            numMaxMinutes.Tag = "maxDurationMinutes";
-
-            // Add after the max duration controls (around line 380)
-            int layoutY = loopY + 35;
-
+            // Preview Size and Layout controls (positioned after RAM estimate to avoid overlap)
             Label lblLayout = new Label
             {
                 Text = "Preview Size:",
-                Location = ScalePoint(buttonX + 870, loopY + 4),
+                Location = ScalePoint(buttonX + 760, loopY + 4),
                 Size = ScaleSize(85, 20),
                 Font = new System.Drawing.Font("Arial", 8)
             };
@@ -972,7 +1014,7 @@ namespace MultiCamRecorder
 
             cmbPreviewSize = new ComboBox
             {
-                Location = ScalePoint(buttonX + 960, loopY),
+                Location = ScalePoint(buttonX + 850, loopY),
                 Size = ScaleSize(100, 25),
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Font = new System.Drawing.Font("Arial", 8)
@@ -991,7 +1033,7 @@ namespace MultiCamRecorder
             Label lblLayoutMode = new Label
             {
                 Text = "Layout:",
-                Location = ScalePoint(buttonX + 1070, loopY + 4),
+                Location = ScalePoint(buttonX + 960, loopY + 4),
                 Size = ScaleSize(45, 20),
                 Font = new System.Drawing.Font("Arial", 8)
             };
@@ -999,7 +1041,7 @@ namespace MultiCamRecorder
 
             cmbLayoutMode = new ComboBox
             {
-                Location = ScalePoint(buttonX + 1120, loopY),
+                Location = ScalePoint(buttonX + 1010, loopY),
                 Size = ScaleSize(90, 25),
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Font = new System.Drawing.Font("Arial", 8)
@@ -1015,17 +1057,6 @@ namespace MultiCamRecorder
             cmbLayoutMode.SelectedIndexChanged += (s, e) => UpdateCameraLayout();
             cmbLayoutMode.Tag = "layoutMode";
             this.Controls.Add(cmbLayoutMode);
-
-            lblRamEstimate = new Label
-            {
-                Text = "Est. RAM: 0 MB",
-                Location = ScalePoint(buttonX + 465, loopY + 4),
-                Size = ScaleSize(150, 20),
-                Font = new System.Drawing.Font("Arial", 8),
-                ForeColor = System.Drawing.Color.Blue,
-                Visible = false  // ← ADD THIS LINE
-            };
-            this.Controls.Add(lblRamEstimate);
 
             // Enable/disable controls based on checkbox
             chkLoopRecording.CheckedChanged += (s, e) =>
@@ -1044,7 +1075,6 @@ namespace MultiCamRecorder
             numExternalTriggerFps.Tag = "externalTriggerFps";
             numLoopDuration.Tag = "loopDuration";
             this.cmbRecordingMode = cmbRecordingMode;
-            this.cmbMaxDurationUnit = cmbMaxDurationUnit;
         }
         private System.Drawing.Bitmap DeepCloneBitmap(System.Drawing.Bitmap source)
         {
@@ -1063,11 +1093,306 @@ namespace MultiCamRecorder
             
             return clone;
         }
+        
+        /// <summary>
+        /// Builds FFmpeg drawtext filter for date/time overlay. Returns filter string or empty if overlay not needed.
+        /// Uses a simpler approach with static text based on recording start time.
+        /// Note: This shows the recording start time, not per-frame time (FFmpeg dynamic time expressions are complex).
+        /// </summary>
+        private string BuildFFmpegDateTimeOverlayFilter(CameraSettings settings, DateTime recordingStartTime, int videoHeight)
+        {
+            if (!settings.ShowDate && !settings.ShowTime)
+                return "";
+            
+            List<string> textParts = new List<string>();
+            
+            if (settings.ShowDate)
+            {
+                // Date: yyyy-MM-dd format from recording start time
+                textParts.Add(recordingStartTime.ToString("yyyy-MM-dd"));
+            }
+            
+            if (settings.ShowTime)
+            {
+                // Time: HH:mm:ss or HH:mm:ss.fff format from recording start time
+                if (settings.ShowMilliseconds)
+                {
+                    textParts.Add(recordingStartTime.ToString("HH:mm:ss.fff"));
+                }
+                else
+                {
+                    textParts.Add(recordingStartTime.ToString("HH:mm:ss"));
+                }
+            }
+            
+            if (textParts.Count == 0)
+                return "";
+            
+            // Combine parts with newline (\\n in C# string becomes \n in FFmpeg filter)
+            // Escape special characters for FFmpeg filter syntax
+            // First escape single quotes, then add newlines
+            for (int i = 0; i < textParts.Count; i++)
+            {
+                textParts[i] = textParts[i].Replace("'", "''").Replace(":", "\\:");
+            }
+            string textExpression = string.Join("\\n", textParts);
+            
+            // Calculate font size based on video height (~2% of height, min 12, max 48)
+            int fontSize = Math.Max(12, Math.Min(48, (int)(videoHeight * 0.02)));
+            
+            // Build the drawtext filter
+            // Use single quotes around text to handle special characters
+            string filter = $"drawtext=text='{textExpression}':x=10:y=10:fontcolor=white@1.0:borderw=2:bordercolor=black@1.0:fontsize={fontSize}:box=0";
+            
+            return filter;
+        }
+        
+        /// <summary>
+        /// Efficiently overlays date/time text on a bitmap using OpenCV. Returns a new bitmap with overlay.
+        /// Optimized for performance to avoid frame rate drops.
+        /// </summary>
+        private System.Drawing.Bitmap ApplyDateTimeOverlay(System.Drawing.Bitmap source, CameraSettings settings, DateTime? frameTime = null)
+        {
+            // Early exit if no overlay needed
+            if (!settings.ShowDate && !settings.ShowTime)
+                return source;
+            
+            DateTime timestamp = frameTime ?? DateTime.Now;
+            
+            // Build overlay text
+            List<string> overlayLines = new List<string>();
+            if (settings.ShowDate)
+            {
+                overlayLines.Add(timestamp.ToString("yyyy-MM-dd"));
+            }
+            if (settings.ShowTime)
+            {
+                string timeFormat = settings.ShowMilliseconds ? "HH:mm:ss.fff" : "HH:mm:ss";
+                overlayLines.Add(timestamp.ToString(timeFormat));
+            }
+            
+            if (overlayLines.Count == 0)
+                return source;
+            
+            try
+            {
+                // Convert bitmap to Mat for efficient OpenCV operations
+                using (Mat mat = OpenCvSharp.Extensions.BitmapConverter.ToMat(source))
+                {
+                    // Ensure we have a color image (3 channels) for text rendering
+                    Mat colorMat;
+                    bool needsConversion = mat.Channels() == 1;
+                    if (needsConversion)
+                    {
+                        colorMat = new Mat();
+                        Cv2.CvtColor(mat, colorMat, ColorConversionCodes.GRAY2BGR);
+                    }
+                    else
+                    {
+                        colorMat = mat;
+                    }
+                    
+                    // Calculate font scale based on resolution (scale to ~0.7% of height)
+                    double fontScale = Math.Max(0.4, Math.Min(2.0, colorMat.Height / 700.0));
+                    int thickness = Math.Max(1, (int)(fontScale * 2));
+                    int padding = Math.Max(5, (int)(colorMat.Height * 0.01)); // 1% of height, min 5px
+                    
+                    // Text properties
+                    HersheyFonts font = HersheyFonts.HersheySimplex;
+                    Scalar textColor = new Scalar(255, 255, 255); // White
+                    Scalar outlineColor = new Scalar(0, 0, 0); // Black
+                    int lineHeight = (int)(fontScale * 30);
+                    
+                    // Draw text with outline for visibility (draw outline first, then text)
+                    int yPos = padding + lineHeight;
+                    foreach (string line in overlayLines)
+                    {
+                        // Draw black outline (thicker, offset in 8 directions)
+                        for (int dx = -thickness; dx <= thickness; dx++)
+                        {
+                            for (int dy = -thickness; dy <= thickness; dy++)
+                            {
+                                if (dx != 0 || dy != 0)
+                                {
+                                    Cv2.PutText(colorMat, line, 
+                                        new OpenCvSharp.Point(padding + dx, yPos + dy), 
+                                        font, fontScale, outlineColor, thickness + 1, LineTypes.AntiAlias);
+                                }
+                            }
+                        }
+                        
+                        // Draw white text on top
+                        Cv2.PutText(colorMat, line, 
+                            new OpenCvSharp.Point(padding, yPos), 
+                            font, fontScale, textColor, thickness, LineTypes.AntiAlias);
+                        
+                        yPos += lineHeight;
+                    }
+                    
+                    // Convert back to bitmap
+                    System.Drawing.Bitmap result;
+                    if (needsConversion)
+                    {
+                        // Convert back to grayscale if original was grayscale
+                        Mat grayMat = new Mat();
+                        Cv2.CvtColor(colorMat, grayMat, ColorConversionCodes.BGR2GRAY);
+                        result = OpenCvSharp.Extensions.BitmapConverter.ToBitmap(grayMat);
+                        grayMat.Dispose();
+                        colorMat.Dispose();
+                    }
+                    else
+                    {
+                        result = OpenCvSharp.Extensions.BitmapConverter.ToBitmap(colorMat);
+                        if (needsConversion)
+                            colorMat.Dispose();
+                    }
+                    
+                    return result;
+                }
+            }
+            catch (Exception ex)
+            {
+                // If overlay fails, return original bitmap
+                LogCameraInfo($"Warning: Date/time overlay failed: {ex.Message}");
+                return source;
+            }
+        }
+        private void ShowSettingsDialog()
+        {
+            using (SettingsDialog dialog = new SettingsDialog(settings))
+            {
+                if (dialog.ShowDialog(this) == DialogResult.OK)
+                {
+                    // Update settings
+                    settings.ShowScreenshotSaveDialog = dialog.Settings.ShowScreenshotSaveDialog;
+                    settings.MaxDurationEnabled = dialog.Settings.MaxDurationEnabled;
+                    settings.MaxDurationValue = dialog.Settings.MaxDurationValue;
+                    settings.MaxDurationUnit = dialog.Settings.MaxDurationUnit;
+                    settings.CharlotteMode = dialog.Settings.CharlotteMode;
+                    settings.Save();
+                    UpdateRecordingButtonColor();
+                }
+            }
+        }
+        
+        private void UpdateRecordingButtonColor()
+        {
+            if (btnStartRecording != null)
+            {
+                if (settings.CharlotteMode)
+                {
+                    btnStartRecording.BackColor = System.Drawing.Color.FromArgb(0, 220, 0); // Bright green
+                    btnStartRecording.ForeColor = System.Drawing.Color.White;
+                }
+                else
+                {
+                    btnStartRecording.BackColor = System.Drawing.SystemColors.Control;
+                    btnStartRecording.ForeColor = System.Drawing.SystemColors.ControlText;
+                }
+            }
+        }
+
+        private void ExportSettings()
+        {
+            try
+            {
+                using (SaveFileDialog saveDialog = new SaveFileDialog())
+                {
+                    saveDialog.Filter = "JSON Files|*.json|All Files|*.*";
+                    saveDialog.FileName = "QueenPix_Settings.json";
+                    saveDialog.Title = "Export Settings";
+
+                    if (saveDialog.ShowDialog(this) == DialogResult.OK)
+                    {
+                        string json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+                        File.WriteAllText(saveDialog.FileName, json);
+                        MessageBox.Show($"Settings exported successfully to:\n{saveDialog.FileName}",
+                                        "Export Successful", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error exporting settings: {ex.Message}",
+                                "Export Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void ImportSettings()
+        {
+            try
+            {
+                using (OpenFileDialog openDialog = new OpenFileDialog())
+                {
+                    openDialog.Filter = "JSON Files|*.json|All Files|*.*";
+                    openDialog.Title = "Import Settings";
+
+                    if (openDialog.ShowDialog(this) == DialogResult.OK)
+                    {
+                        string json = File.ReadAllText(openDialog.FileName);
+                        UserSettings? importedSettings = JsonSerializer.Deserialize<UserSettings>(json);
+
+                        if (importedSettings == null)
+                        {
+                            MessageBox.Show("Invalid settings file format.",
+                                            "Import Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            return;
+                        }
+
+                        var result = MessageBox.Show(
+                            "Importing settings will replace your current settings.\n\n" +
+                            "This includes:\n" +
+                            "• Working folder\n" +
+                            "• FFmpeg path\n" +
+                            "• Screenshot settings\n" +
+                            "• Max duration settings\n" +
+                            "• Camera settings\n" +
+                            "• Camera name profiles\n\n" +
+                            "Continue?",
+                            "Confirm Import",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Question);
+
+                        if (result == DialogResult.Yes)
+                        {
+                            // Merge settings (keep current camera settings if cameras are active)
+                            settings.WorkingFolder = importedSettings.WorkingFolder;
+                            settings.FfmpegPath = importedSettings.FfmpegPath;
+                            settings.ShowScreenshotSaveDialog = importedSettings.ShowScreenshotSaveDialog;
+                            settings.MaxDurationEnabled = importedSettings.MaxDurationEnabled;
+                            settings.MaxDurationValue = importedSettings.MaxDurationValue;
+                            settings.MaxDurationUnit = importedSettings.MaxDurationUnit;
+                            settings.CharlotteMode = importedSettings.CharlotteMode;
+                            settings.CameraSettingsByDevice = importedSettings.CameraSettingsByDevice;
+                            settings.NameProfiles = importedSettings.NameProfiles;
+                            settings.LastUsedProfile = importedSettings.LastUsedProfile;
+
+                            settings.Save();
+
+                            // Update UI
+                            txtWorkingFolder.Text = settings.WorkingFolder;
+                            CheckDiskSpace();
+                            UpdateRecordingButtonColor();
+
+                            MessageBox.Show("Settings imported successfully!\n\n" +
+                                          "You may need to refresh cameras for camera settings to take effect.",
+                                          "Import Successful", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error importing settings: {ex.Message}",
+                                "Import Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
         private void ShowCapacityCalculator()
         {
             Form calcForm = new Form
             {
-                Text = "Capacity Calculator",
+                Text = "Loop Recording RAM Calculator",
                 Size = new System.Drawing.Size(750, 650),
                 StartPosition = FormStartPosition.CenterParent,
                 FormBorderStyle = FormBorderStyle.FixedDialog,
@@ -1437,27 +1762,30 @@ namespace MultiCamRecorder
             Form testTypeForm = new Form
             {
                 Text = "Recording Test",
-                Size = new System.Drawing.Size(450, 200),
+                Size = new System.Drawing.Size(470, 240),
                 StartPosition = FormStartPosition.CenterParent,
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 MaximizeBox = false,
                 MinimizeBox = false
             };
             
+            int y = 30;
+            
             Label lblQuestion = new Label
             {
                 Text = "What type of recording do you want to test?",
-                Location = new System.Drawing.Point(20, 20),
-                Size = new System.Drawing.Size(400, 30),
+                Location = new System.Drawing.Point(30, y),
+                Size = new System.Drawing.Size(410, 25),
                 Font = new System.Drawing.Font("Arial", 10, System.Drawing.FontStyle.Bold)
             };
             testTypeForm.Controls.Add(lblQuestion);
+            y += 45;
             
             Button btnLoopTest = new Button
             {
                 Text = "Loop Recording Test",
-                Location = new System.Drawing.Point(40, 70),
-                Size = new System.Drawing.Size(160, 50),
+                Location = new System.Drawing.Point(45, y),
+                Size = new System.Drawing.Size(180, 50),
                 Font = new System.Drawing.Font("Arial", 10)
             };
             testTypeForm.Controls.Add(btnLoopTest);
@@ -1465,17 +1793,18 @@ namespace MultiCamRecorder
             Button btnVideoTest = new Button
             {
                 Text = "Video Recording Test",
-                Location = new System.Drawing.Point(230, 70),
-                Size = new System.Drawing.Size(160, 50),
+                Location = new System.Drawing.Point(245, y),
+                Size = new System.Drawing.Size(180, 50),
                 Font = new System.Drawing.Font("Arial", 10)
             };
             testTypeForm.Controls.Add(btnVideoTest);
+            y += 75;
             
             Button btnCancel = new Button
             {
                 Text = "Cancel",
-                Location = new System.Drawing.Point(165, 130),
-                Size = new System.Drawing.Size(100, 30),
+                Location = new System.Drawing.Point(185, y),
+                Size = new System.Drawing.Size(100, 35),
                 DialogResult = DialogResult.Cancel
             };
             testTypeForm.Controls.Add(btnCancel);
@@ -1488,6 +1817,7 @@ namespace MultiCamRecorder
             {
                 isLoopTest = true;
                 testChosen = true;
+                testTypeForm.DialogResult = DialogResult.OK;
                 testTypeForm.Close();
             };
             
@@ -1495,35 +1825,35 @@ namespace MultiCamRecorder
             {
                 isLoopTest = false;
                 testChosen = true;
+                testTypeForm.DialogResult = DialogResult.OK;
                 testTypeForm.Close();
             };
             
-            testTypeForm.ShowDialog();
-            
-            if (!testChosen)
+            if (testTypeForm.ShowDialog() != DialogResult.OK || !testChosen)
                 return;
             
-            // STEP 2: Configure test parameters
+            // STEP 2: Configure test parameters using unified dialog
             Dictionary<int, double> cameraExpectedFps = new Dictionary<int, double>();
             double testDuration = 0;
+            double loopDuration = 0;
             
             if (isLoopTest)
             {
-                // Configure Loop Test
-                if (!ConfigureLoopTest(out cameraExpectedFps, out testDuration))
+                // Configure Loop Test - unified dialog with loop duration
+                if (!ConfigureRecordingTest(isLoopTest: true, out cameraExpectedFps, out testDuration, out loopDuration))
                     return;
             }
             else
             {
-                // Configure Video Test
-                if (!ConfigureVideoTest(out cameraExpectedFps, out testDuration))
+                // Configure Video Test - unified dialog without loop duration
+                if (!ConfigureRecordingTest(isLoopTest: false, out cameraExpectedFps, out testDuration, out loopDuration))
                     return;
             }
             
             // STEP 3: Run the test
             if (isLoopTest)
             {
-                RunLoopRecordingTest(cameraExpectedFps, testDuration);
+                RunLoopRecordingTest(cameraExpectedFps, loopDuration);
             }
             else
             {
@@ -1531,210 +1861,19 @@ namespace MultiCamRecorder
             }
         }
 
-        private bool ConfigureLoopTest(out Dictionary<int, double> cameraExpectedFps, out double loopDuration)
-        {
-            cameraExpectedFps = new Dictionary<int, double>();
-            loopDuration = 5.0;
-            
-            Form configForm = new Form
-            {
-                Text = "Configure Loop Recording Test",
-                Size = new System.Drawing.Size(500, 200 + (cameras.Count * 40)),
-                StartPosition = FormStartPosition.CenterParent,
-                FormBorderStyle = FormBorderStyle.FixedDialog,
-                MaximizeBox = false,
-                MinimizeBox = false
-            };
-            
-            int y = 20;
-            
-            Label lblInfo = new Label
-            {
-                Text = "Set expected FPS for each camera:",
-                Location = new System.Drawing.Point(20, y),
-                Size = new System.Drawing.Size(450, 20),
-                Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
-            };
-            configForm.Controls.Add(lblInfo);
-            y += 30;
-            
-            // FPS controls for each camera
-            List<NumericUpDown> fpsControls = new List<NumericUpDown>();
-            CheckBox chkApplyAll = null;
-            
-            for (int i = 0; i < cameras.Count; i++)
-            {
-                Label lblCamera = new Label
-                {
-                    Text = $"{cameras[i].CustomName}:",
-                    Location = new System.Drawing.Point(40, y + 2),
-                    Size = new System.Drawing.Size(150, 20)
-                };
-                configForm.Controls.Add(lblCamera);
-                
-                NumericUpDown numFps = new NumericUpDown
-                {
-                    Location = new System.Drawing.Point(200, y),
-                    Size = new System.Drawing.Size(80, 25),
-                    Minimum = 1,
-                    Maximum = 240,
-                    DecimalPlaces = 1,
-                    Value = cameras[i].Settings.UseExternalTrigger ? (decimal)numExternalTriggerFps.Value : (decimal)cameras[i].Settings.SoftwareFrameRate  // ← FIXED
-                };
-                configForm.Controls.Add(numFps);
-                fpsControls.Add(numFps);
-                
-                Label lblFpsUnit = new Label
-                {
-                    Text = "fps",
-                    Location = new System.Drawing.Point(290, y + 2),
-                    Size = new System.Drawing.Size(30, 20)
-                };
-                configForm.Controls.Add(lblFpsUnit);
-                
-                // Add "Apply to All" checkbox after first camera
-                if (i == 0)
-                {
-                    chkApplyAll = new CheckBox
-                    {
-                        Text = "Apply to All",
-                        Location = new System.Drawing.Point(330, y + 2),
-                        Size = new System.Drawing.Size(120, 20)
-                    };
-                    
-                    chkApplyAll.CheckedChanged += (s, e) =>
-                    {
-                        if (chkApplyAll.Checked)
-                        {
-                            double firstFps = (double)fpsControls[0].Value;
-                            for (int j = 1; j < fpsControls.Count; j++)
-                            {
-                                fpsControls[j].Value = (decimal)firstFps;
-                                fpsControls[j].Enabled = false;
-                            }
-                        }
-                        else
-                        {
-                            for (int j = 1; j < fpsControls.Count; j++)
-                            {
-                                fpsControls[j].Enabled = true;
-                            }
-                        }
-                    };
-                    
-                    // Also apply when first camera FPS changes and "Apply to All" is checked
-                    fpsControls[0].ValueChanged += (s, e) =>
-                    {
-                        if (chkApplyAll.Checked)
-                        {
-                            double firstFps = (double)fpsControls[0].Value;
-                            for (int j = 1; j < fpsControls.Count; j++)
-                            {
-                                fpsControls[j].Value = (decimal)firstFps;
-                            }
-                        }
-                    };
-                    
-                    configForm.Controls.Add(chkApplyAll);
-                }
-                
-                y += 35;
-            }
-            
-            // Loop duration
-            y += 10;
-            Label lblDuration = new Label
-            {
-                Text = "Loop Duration:",
-                Location = new System.Drawing.Point(40, y + 2),
-                Size = new System.Drawing.Size(150, 20),
-                Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
-            };
-            configForm.Controls.Add(lblDuration);
-            
-            NumericUpDown numDuration = new NumericUpDown
-            {
-                Location = new System.Drawing.Point(200, y),
-                Size = new System.Drawing.Size(80, 25),
-                Minimum = 1,
-                Maximum = 60,
-                Value = 5
-            };
-            configForm.Controls.Add(numDuration);
-            
-            Label lblDurationUnit = new Label
-            {
-                Text = "seconds",
-                Location = new System.Drawing.Point(290, y + 2),
-                Size = new System.Drawing.Size(60, 20)
-            };
-            configForm.Controls.Add(lblDurationUnit);
-            
-            y += 40;
-            
-            Label lblNote = new Label
-            {
-                Text = $"Test will record for {3}× loop duration (total: 15 seconds)",
-                Location = new System.Drawing.Point(40, y),
-                Size = new System.Drawing.Size(420, 20),
-                ForeColor = System.Drawing.Color.Blue,
-                Font = new System.Drawing.Font("Arial", 8)
-            };
-            configForm.Controls.Add(lblNote);
-            
-            // Update note dynamically
-            numDuration.ValueChanged += (s, e) =>
-            {
-                int totalSeconds = (int)numDuration.Value * 3;
-                lblNote.Text = $"Test will record for 3× loop duration (total: {totalSeconds} seconds)";
-            };
-            
-            y += 30;
-            
-            // Buttons
-            Button btnCancelConfig = new Button
-            {
-                Text = "Cancel",
-                Location = new System.Drawing.Point(220, y),
-                Size = new System.Drawing.Size(100, 35),
-                DialogResult = DialogResult.Cancel
-            };
-            configForm.Controls.Add(btnCancelConfig);
-            
-            Button btnStart = new Button
-            {
-                Text = "Start Test",
-                Location = new System.Drawing.Point(330, y),
-                Size = new System.Drawing.Size(120, 35),
-                DialogResult = DialogResult.OK
-            };
-            configForm.Controls.Add(btnStart);
-            
-            configForm.AcceptButton = btnStart;
-            configForm.CancelButton = btnCancelConfig;
-            
-            if (configForm.ShowDialog() != DialogResult.OK)
-                return false;
-            
-            // Collect settings
-            for (int i = 0; i < cameras.Count; i++)
-            {
-                cameraExpectedFps[i] = (double)fpsControls[i].Value;
-            }
-            loopDuration = (double)numDuration.Value;
-            
-            return true;
-        }
-
-        private bool ConfigureVideoTest(out Dictionary<int, double> cameraExpectedFps, out double testDuration)
+        private bool ConfigureRecordingTest(bool isLoopTest, out Dictionary<int, double> cameraExpectedFps, out double testDuration, out double loopDuration)
         {
             cameraExpectedFps = new Dictionary<int, double>();
             testDuration = 15.0;
+            loopDuration = 30.0;
+            
+            string testType = isLoopTest ? "Loop Recording Test" : "Video Recording Test";
+            int baseHeight = isLoopTest ? 280 : 240;
             
             Form configForm = new Form
             {
-                Text = "Configure Video Recording Test",
-                Size = new System.Drawing.Size(500, 200 + (cameras.Count * 40)),
+                Text = $"Configure {testType}",
+                Size = new System.Drawing.Size(500, baseHeight + (cameras.Count * 40)),
                 StartPosition = FormStartPosition.CenterParent,
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 MaximizeBox = false,
@@ -1767,6 +1906,22 @@ namespace MultiCamRecorder
                 };
                 configForm.Controls.Add(lblCamera);
                 
+                // Auto-detect expected FPS if not already set
+                decimal defaultFps;
+                if (cameras[i].Settings.UseExternalTrigger)
+                {
+                    defaultFps = (decimal)numExternalTriggerFps.Value;
+                }
+                else if (cameras[i].Settings.SoftwareFrameRate > 0)
+                {
+                    defaultFps = (decimal)cameras[i].Settings.SoftwareFrameRate;
+                }
+                else
+                {
+                    // Default to 30 fps if not set
+                    defaultFps = 30.0m;
+                }
+                
                 NumericUpDown numFps = new NumericUpDown
                 {
                     Location = new System.Drawing.Point(200, y),
@@ -1774,7 +1929,7 @@ namespace MultiCamRecorder
                     Minimum = 1,
                     Maximum = 240,
                     DecimalPlaces = 1,
-                    Value = cameras[i].Settings.UseExternalTrigger ? (decimal)numExternalTriggerFps.Value : (decimal)cameras[i].Settings.SoftwareFrameRate  // ← FIXED
+                    Value = defaultFps
                 };
                 configForm.Controls.Add(numFps);
                 fpsControls.Add(numFps);
@@ -1834,6 +1989,40 @@ namespace MultiCamRecorder
                 }
                 
                 y += 35;
+            }
+            
+            // Loop duration (only for loop test)
+            NumericUpDown numLoopDuration = null;
+            if (isLoopTest)
+            {
+                y += 10;
+                Label lblLoopDuration = new Label
+                {
+                    Text = "Loop Duration:",
+                    Location = new System.Drawing.Point(40, y + 2),
+                    Size = new System.Drawing.Size(150, 20),
+                    Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
+                };
+                configForm.Controls.Add(lblLoopDuration);
+                
+                numLoopDuration = new NumericUpDown
+                {
+                    Location = new System.Drawing.Point(200, y),
+                    Size = new System.Drawing.Size(80, 25),
+                    Minimum = 5,
+                    Maximum = 600,
+                    Value = (decimal)this.numLoopDuration.Value  // Default to current UI value
+                };
+                configForm.Controls.Add(numLoopDuration);
+                
+                Label lblLoopDurationUnit = new Label
+                {
+                    Text = "seconds",
+                    Location = new System.Drawing.Point(290, y + 2),
+                    Size = new System.Drawing.Size(60, 20)
+                };
+                configForm.Controls.Add(lblLoopDurationUnit);
+                y += 40;
             }
             
             // Test recording length
@@ -1853,9 +2042,18 @@ namespace MultiCamRecorder
                 Size = new System.Drawing.Size(80, 25),
                 Minimum = 5,
                 Maximum = 300,
-                Value = 15
+                Value = isLoopTest ? (numLoopDuration?.Value ?? 30) : 15  // Default to loop duration for loop test, 15 for video test
             };
             configForm.Controls.Add(numDuration);
+            
+            // If loop test, sync duration with loop duration when loop duration changes
+            if (isLoopTest && numLoopDuration != null)
+            {
+                numLoopDuration.ValueChanged += (s, e) =>
+                {
+                    numDuration.Value = numLoopDuration.Value;
+                };
+            }
             
             Label lblDurationUnit = new Label
             {
@@ -1869,7 +2067,9 @@ namespace MultiCamRecorder
             
             Label lblNote = new Label
             {
-                Text = "Videos will be saved to your working folder for analysis",
+                Text = isLoopTest 
+                    ? "Test will use loop recording mode regardless of current Recording Mode setting"
+                    : "Videos will be saved to your working folder for analysis",
                 Location = new System.Drawing.Point(40, y),
                 Size = new System.Drawing.Size(420, 20),
                 ForeColor = System.Drawing.Color.Blue,
@@ -1902,7 +2102,12 @@ namespace MultiCamRecorder
             configForm.CancelButton = btnCancelConfig;
             
             if (configForm.ShowDialog() != DialogResult.OK)
+            {
+                cameraExpectedFps = new Dictionary<int, double>();
+                testDuration = 0;
+                loopDuration = 0;
                 return false;
+            }
             
             // Collect settings
             for (int i = 0; i < cameras.Count; i++)
@@ -1910,30 +2115,98 @@ namespace MultiCamRecorder
                 cameraExpectedFps[i] = (double)fpsControls[i].Value;
             }
             testDuration = (double)numDuration.Value;
+            if (isLoopTest && numLoopDuration != null)
+            {
+                loopDuration = (double)numLoopDuration.Value;
+            }
+            else
+            {
+                loopDuration = 0; // Not used for video test
+            }
+            
+            // Log configuration
+            string testTypeName = isLoopTest ? "Loop Recording Test" : "Video Recording Test";
+            LogCameraInfo($"{testTypeName} Configuration:");
+            if (isLoopTest)
+            {
+                LogCameraInfo($"  Loop Duration: {loopDuration}s");
+            }
+            LogCameraInfo($"  Test Recording Length: {testDuration}s");
+            LogCameraInfo($"  Expected FPS values:");
+            for (int i = 0; i < cameras.Count; i++)
+            {
+                LogCameraInfo($"  {cameras[i].CustomName}: Expected FPS = {cameraExpectedFps[i]} fps ({ (cameras[i].Settings.UseExternalTrigger ? "external trigger" : "software controlled") })");
+            }
             
             return true;
         }
 
+        // Helper method to check if current format is Y800/Mono8
+        private bool IsY800Format(ICImagingControl control)
+        {
+            try
+            {
+                // First try VideoFormatCurrent (if camera is running)
+                if (control?.VideoFormatCurrent != null)
+                {
+                    string format = control.VideoFormatCurrent.ToString();
+                    if (format.Contains("Y800") || format.Contains("Mono8"))
+                        return true;
+                }
+                
+                // Fallback: Check VideoFormat (the format that's been set)
+                if (control?.VideoFormat != null)
+                {
+                    string format = control.VideoFormat.ToString();
+                    if (format.Contains("Y800") || format.Contains("Mono8"))
+                        return true;
+                }
+                
+                // Also check saved settings
+                var camera = cameras.FirstOrDefault(c => c.ImagingControl == control);
+                if (camera?.Settings != null && !string.IsNullOrEmpty(camera.Settings.Format))
+                {
+                    string format = camera.Settings.Format;
+                    if (format.Contains("Y800") || format.Contains("Mono8"))
+                        return true;
+                }
+            }
+            catch { }
+            
+            return false;
+        }
+
         private void RunLoopRecordingTest(Dictionary<int, double> cameraExpectedFps, double loopDuration)
         {
-            // Save current loop settings
+            // Save current settings
             bool wasLoopEnabled = chkLoopRecording.Checked;
             int oldDuration = (int)numLoopDuration.Value;
             double oldFps = (double)numExternalTriggerFps.Value;
+            string oldRecordingMode = cmbRecordingMode.SelectedItem?.ToString() ?? "Normal Recording";
             
             try
             {
                 isBenchmarkMode = true;
+                
+                // Set recording mode to Loop Recording for test (regardless of current setting)
+                cmbRecordingMode.SelectedItem = "Loop Recording";
                 
                 // Configure loop recording for test
                 chkLoopRecording.Checked = true;
                 numLoopDuration.Value = (decimal)loopDuration;
                 numExternalTriggerFps.Enabled = true;
                 
-                double totalTestDuration = loopDuration * 3;
+                // Use the loop duration directly (not 3x) - record for exactly that duration
+                double totalTestDuration = loopDuration;
                 
                 LogCameraInfo($"=== LOOP RECORDING TEST START ===");
-                LogCameraInfo($"Loop duration: {loopDuration}s, Total test: {totalTestDuration}s");
+                LogCameraInfo($"Test duration: {totalTestDuration}s (using loop duration from configuration)");
+                LogCameraInfo($"Expected FPS values:");
+                for (int i = 0; i < cameras.Count; i++)
+                {
+                    LogCameraInfo($"  {cameras[i].CustomName}: {cameraExpectedFps[i]} fps");
+                }
+                LogCameraInfo($"Test logic: Record for {totalTestDuration}s, count frames, calculate actual FPS = frames/time, compare to expected FPS");
                 
                 // Create progress dialog
                 Form testForm = new Form
@@ -2125,6 +2398,8 @@ namespace MultiCamRecorder
                             btnStopRecording.Enabled = false;
                             chkLoopRecording.Enabled = true;
                             numLoopDuration.Enabled = chkLoopRecording.Checked;
+                            // Re-enable recording mode dropdown
+                            cmbRecordingMode.Enabled = true;
                         }
                         
                         testForm.Close();
@@ -2148,6 +2423,9 @@ namespace MultiCamRecorder
                 chkLoopRecording.Checked = wasLoopEnabled;
                 numLoopDuration.Value = oldDuration;
                 numExternalTriggerFps.Value = (decimal)oldFps;
+                // Restore recording mode and re-enable dropdown
+                cmbRecordingMode.SelectedItem = oldRecordingMode;
+                cmbRecordingMode.Enabled = true;
                 isBenchmarkMode = false;
             }
         }
@@ -2170,6 +2448,7 @@ namespace MultiCamRecorder
             int totalCaptured = 0;
             int totalDropped = 0;
             bool allGood = true;
+            bool allFpsAccurate = true;
             
             for (int i = 0; i < cameras.Count; i++)
             {
@@ -2186,12 +2465,16 @@ namespace MultiCamRecorder
                 int capturedFrames = (int)camera.ExpectedFrameCount;
                 int droppedFrames = camera.DroppedFrames;
                 double dropRate = expectedFrames > 0 ? (droppedFrames / (double)expectedFrames) * 100 : 0;
+                double actualFps = cameraDuration > 0 ? capturedFrames / cameraDuration : 0;
+                double fpsAccuracy = expectedFps > 0 ? (actualFps / expectedFps) * 100 : 0;
                 
                 totalExpected += expectedFrames;
                 totalCaptured += capturedFrames;
                 totalDropped += droppedFrames;
                 
                 if (dropRate >= 5) allGood = false;
+                // Check if FPS accuracy is within acceptable range (95-105%)
+                if (Math.Abs(fpsAccuracy - 100) > 5) allFpsAccurate = false;
             }
             
             // Overall verdict
@@ -2201,24 +2484,28 @@ namespace MultiCamRecorder
             string overallVerdict = "";
             System.Drawing.Color overallVerdictColor;
             
-            if (allGood && overallDropRate == 0 && overallCaptureRate >= 99)
+            // EXCELLENT: No drops, capture rate close to 100%, and all cameras have accurate FPS
+            if (allGood && allFpsAccurate && overallDropRate == 0 && overallCaptureRate >= 99 && overallCaptureRate <= 101)
             {
                 overallVerdict = "✅ EXCELLENT - Perfect capture!";
                 overallVerdictColor = System.Drawing.Color.Green;
             }
-            else if (overallDropRate < 1 && overallCaptureRate >= 95)
+            // GOOD: Minimal drops, capture rate 95-105%, and FPS accuracy within 10%
+            else if (overallDropRate < 1 && overallCaptureRate >= 95 && overallCaptureRate <= 105)
             {
                 overallVerdict = "✅ GOOD - Minimal frame loss";
                 overallVerdictColor = System.Drawing.Color.Green;
             }
+            // ACCEPTABLE: Some drops or moderate FPS deviation
             else if (overallDropRate < 5)
             {
-                overallVerdict = "⚠️ ACCEPTABLE - Some frame drops detected";
+                overallVerdict = "⚠️ ACCEPTABLE - Some frame drops or FPS accuracy issues detected";
                 overallVerdictColor = System.Drawing.Color.Orange;
             }
+            // POOR: High drop rate or significant FPS deviation
             else
             {
-                overallVerdict = "❌ POOR - High frame drop rate";
+                overallVerdict = "❌ POOR - High frame drop rate or significant FPS accuracy issues";
                 overallVerdictColor = System.Drawing.Color.Red;
             }
             
@@ -2294,24 +2581,29 @@ namespace MultiCamRecorder
                 double dropRate = expectedFrames > 0 ? (droppedFrames / (double)expectedFrames) * 100 : 0;
                 double captureRate = expectedFrames > 0 ? (capturedFrames / (double)expectedFrames) * 100 : 0;
                 double actualFps = cameraDuration > 0 ? capturedFrames / cameraDuration : 0;
+                double fpsAccuracy = expectedFps > 0 ? (actualFps / expectedFps) * 100 : 0;
                 
                 string verdict = "";
                 System.Drawing.Color verdictColor;
-                if (dropRate == 0 && captureRate >= 99)
+                // EXCELLENT: No drops, capture rate close to 100%, and FPS accuracy within 5%
+                if (dropRate == 0 && captureRate >= 99 && captureRate <= 101 && Math.Abs(fpsAccuracy - 100) <= 5)
                 {
                     verdict = "✅ EXCELLENT";
                     verdictColor = System.Drawing.Color.Green;
                 }
-                else if (dropRate < 1 && captureRate >= 95)
+                // GOOD: Minimal drops, capture rate 95-105%, and FPS accuracy within 10%
+                else if (dropRate < 1 && captureRate >= 95 && captureRate <= 105 && Math.Abs(fpsAccuracy - 100) <= 10)
                 {
                     verdict = "✅ GOOD";
                     verdictColor = System.Drawing.Color.Green;
                 }
-                else if (dropRate < 5)
+                // ACCEPTABLE: Some drops or moderate FPS deviation
+                else if (dropRate < 5 && Math.Abs(fpsAccuracy - 100) <= 20)
                 {
                     verdict = "⚠️ ACCEPTABLE";
                     verdictColor = System.Drawing.Color.Orange;
                 }
+                // POOR: High drop rate or significant FPS deviation
                 else
                 {
                     verdict = "❌ POOR";
@@ -2356,8 +2648,10 @@ namespace MultiCamRecorder
                 
                 // Accuracy metrics
                 int frameDifference = capturedFrames - expectedFrames;
+                // fpsAccuracy already calculated above for verdict
                 string accuracyText = $"Capture Rate: {captureRate:F1}% ({frameDifference:+0;-0} frames)  |  " +
-                                    $"Dropped: {droppedFrames:N0} ({dropRate:F2}%)";
+                                    $"Dropped: {droppedFrames:N0} ({dropRate:F2}%)  |  " +
+                                    $"FPS Accuracy: {fpsAccuracy:F1}% (Expected: {expectedFps:F1} fps, Actual: {actualFps:F2} fps)";
                 Label lblAccuracy = new Label
                 {
                     Text = accuracyText,
@@ -2406,12 +2700,16 @@ namespace MultiCamRecorder
 
         private void RunVideoRecordingTest(Dictionary<int, double> cameraExpectedFps, double testDuration)
         {
-            // Save current loop setting
+            // Save current settings
             bool wasLoopEnabled = chkLoopRecording.Checked;
+            string oldRecordingMode = cmbRecordingMode.SelectedItem?.ToString() ?? "Normal Recording";
             
             try
             {
                 isBenchmarkMode = true;
+                
+                // Set recording mode to Normal Recording for test (regardless of current setting)
+                cmbRecordingMode.SelectedItem = "Normal Recording";
                 
                 // Disable loop recording for video test
                 chkLoopRecording.Checked = false;
@@ -2509,11 +2807,26 @@ namespace MultiCamRecorder
                         string aviFile = Path.Combine(workingFolder, $"Test_{timestamp}_{safeName}.avi");
                         testVideoFiles.Add(aviFile);
                         
-                        // Create MediaStreamSink with NO compression
+                        // Check if Y800 format (requires FrameHandlerSink)
+                        // Log current format for debugging
+                        string currentFormatStr = "Unknown";
+                        try
+                        {
+                            if (camera.ImagingControl.VideoFormatCurrent != null)
+                                currentFormatStr = camera.ImagingControl.VideoFormatCurrent.ToString();
+                            else if (camera.ImagingControl.VideoFormat != null)
+                                currentFormatStr = camera.ImagingControl.VideoFormat.ToString();
+                            else if (camera.Settings != null && !string.IsNullOrEmpty(camera.Settings.Format))
+                                currentFormatStr = camera.Settings.Format;
+                        }
+                        catch { }
+                        
+                        LogCameraInfo($"{camera.CustomName}: Test recording - Checking format - Current: {currentFormatStr}");
+                        
+                        // All formats: Use MediaStreamSink (preserves quality)
+                        // Overlay will be applied during conversion/trimming using FFmpeg
                         MediaStreamSink sink = new MediaStreamSink((AviCompressor?)null, aviFile);
                         sinks.Add(sink);
-                        
-                        // Set sink
                         camera.ImagingControl.Sink = sink;
                         
                         LogCameraInfo($"{camera.CustomName}: Recording to {aviFile}");
@@ -2581,6 +2894,9 @@ namespace MultiCamRecorder
                         
                         // Stop camera
                         camera.ImagingControl.LiveStop();
+                        
+                        // Restore original sink
+                        camera.ImagingControl.Sink = camera.OriginalSink;
                         
                         LogCameraInfo($"{camera.CustomName}: Stopped at {camera.RecordingStopTime.Value:HH:mm:ss.fff}");
                     }
@@ -2687,6 +3003,8 @@ namespace MultiCamRecorder
             {
                 // Restore settings
                 chkLoopRecording.Checked = wasLoopEnabled;
+                // Restore recording mode
+                cmbRecordingMode.SelectedItem = oldRecordingMode;
                 isBenchmarkMode = false;
             }
         }
@@ -3296,7 +3614,6 @@ namespace MultiCamRecorder
                 // Determine status based on ACTUAL hardware
                 string statusIcon = "";
                 System.Drawing.Color statusColor = System.Drawing.Color.Green;
-                string warningText = "";
                 
                 // RAM thresholds based on actual available RAM
                 bool ramCritical = ramPercentage > 80;  // Using >80% of available RAM
@@ -3312,25 +3629,21 @@ namespace MultiCamRecorder
                 {
                     statusIcon = "❌";
                     statusColor = System.Drawing.Color.Red;
-                    warningText = " NOT RECOMMENDED";
                 }
                 else if (ramHigh || cpuHigh)
                 {
                     statusIcon = "⚠️";
                     statusColor = System.Drawing.Color.Orange;
-                    warningText = " BORDERLINE";
                 }
                 else if (ramModerate || cpuModerate)
                 {
                     statusIcon = "⚠️";
                     statusColor = System.Drawing.Color.DarkOrange;
-                    warningText = " HIGH";
                 }
                 else
                 {
                     statusIcon = "✅";
                     statusColor = System.Drawing.Color.Green;
-                    warningText = " OK";
                 }
                 
                 // Display
@@ -3391,6 +3704,101 @@ namespace MultiCamRecorder
             diskMonitorTimer.Tick += (s, e) => MonitorDiskWriteSpeed();
             diskMonitorTimer.Start();
         }
+
+        private async void ShowSplashScreenAndDetectCameras()
+        {
+            // Hide main form initially (before showing splash)
+            this.WindowState = FormWindowState.Minimized;
+            this.ShowInTaskbar = false;
+            this.Opacity = 0;
+            this.Visible = false;
+            
+            SplashScreen splash = new SplashScreen();
+            splash.Show();
+            Application.DoEvents(); // Ensure splash screen is visible
+
+            // Run camera detection (this may take a moment)
+            DetectAndSetupCameras(suppressMessage: true);
+
+            // Update splash screen with result
+            if (cameras.Count > 0)
+            {
+                splash.UpdateMessage($"Detected {cameras.Count} camera{(cameras.Count == 1 ? "" : "s")}!");
+            }
+            else
+            {
+                splash.UpdateMessage("No cameras detected");
+            }
+
+            Application.DoEvents();
+            await splash.CloseAfterDelay(1500); // Show result for 1.5 seconds
+
+            splash.Close();
+
+            // Now show the main form - ensure we're on UI thread
+            if (this.InvokeRequired)
+            {
+                this.Invoke(new Action(() => ShowMainForm()));
+            }
+            else
+            {
+                ShowMainForm();
+            }
+        }
+
+        private void ShowMainForm()
+        {
+            // Now show the main form - restore visibility and state first
+            this.Opacity = 1.0;
+            this.ShowInTaskbar = true;
+            this.Visible = true;
+            this.WindowState = FormWindowState.Normal;
+            
+            // Force refresh to ensure form size is correct
+            this.Show();
+            this.Refresh();
+            this.Update();
+            Application.DoEvents();
+            
+            // Position window in center of screen (after form is shown and sized)
+            int screenWidth = Screen.PrimaryScreen.WorkingArea.Width;
+            int screenHeight = Screen.PrimaryScreen.WorkingArea.Height;
+            
+            // Get actual form size (may be different from Width/Height if window state changed)
+            int formWidth = this.Width;
+            int formHeight = this.Height;
+            
+            // Center the form
+            int xPos = (screenWidth - formWidth) / 2;
+            int yPos = (screenHeight - formHeight) / 2;
+            
+            // If form is wider than screen, align to left edge instead
+            if (formWidth > screenWidth)
+            {
+                xPos = 0;
+            }
+            else
+            {
+                // Ensure at least 200px is visible on the right
+                xPos = Math.Max(0, Math.Min(xPos, screenWidth - 200));
+            }
+            
+            // Ensure at least 100px is visible at the bottom
+            yPos = Math.Max(0, Math.Min(yPos, screenHeight - 100));
+            
+            this.Location = new System.Drawing.Point(xPos, yPos);
+            
+            // Force refresh and activation
+            this.BringToFront();
+            this.Activate();
+            this.Focus();
+            
+            // Ensure all controls are visible and refreshed
+            this.Invalidate(true);
+            this.PerformLayout();
+            
+            Application.DoEvents();
+        }
         
         private void DetectAndSetupCameras(bool suppressMessage = false)
         {
@@ -3409,8 +3817,8 @@ namespace MultiCamRecorder
                 this.Controls.Remove(cam.ImagingControl);
                 this.Controls.Remove(cam.NameLabel);
                 this.Controls.Remove(cam.FpsLabel);
-                this.Controls.Remove(cam.NameTextBox);      // ADD THIS LINE
-                this.Controls.Remove(cam.SettingsButton);   // ADD THIS LINE
+                this.Controls.Remove(cam.NameTextBox);
+                this.Controls.Remove(cam.SettingsButton);
                 cam.ImagingControl.Dispose();
             }
             cameras.Clear();
@@ -3452,7 +3860,7 @@ namespace MultiCamRecorder
                     Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold),
                     BorderStyle = BorderStyle.FixedSingle
                 };
-                camera.CustomName = $"Camera{i + 1}";  // ADD THIS LINE to sync CustomName with TextBox
+                camera.CustomName = $"Camera{i + 1}";
                 int capturedIndex = i; // Capture for event handler
                 camera.NameTextBox.TextChanged += (s, e) => 
                 {
@@ -3573,6 +3981,9 @@ namespace MultiCamRecorder
                     camera.ImagingControl.DeviceLost += (s, e) =>
                     {
                         LogCameraInfo($"Camera {cameraIndex + 1} DEVICE LOST during recording!");
+                        // Update camera name label to show disconnected status
+                        camera.NameLabel.Text = $"{deviceName} [DISCONNECTED]";
+                        camera.NameLabel.ForeColor = System.Drawing.Color.Red;
                         if (isRecording)
                         {
                             MessageBox.Show($"WARNING: Camera {cameraIndex + 1} disconnected during recording!",
@@ -3605,13 +4016,15 @@ namespace MultiCamRecorder
                 }
                 
                 // Update RAM estimate with new camera info
-                UpdateRamEstimate();  // ← ADD THIS LINE
+                UpdateRamEstimate();
             }
 
             int requiredWidth = SIDE_MARGIN * 2 + (cameras.Count * (CAMERA_WIDTH + CAMERA_SPACING));
             if (requiredWidth > this.Width)
             {
-                this.Width = Math.Min(requiredWidth, 1920);
+                // Allow window to be wider than screen for horizontal scrolling
+                // Cap at reasonable maximum (5000px) to prevent excessive width
+                this.Width = Math.Min(requiredWidth, 5000);
             }
             UpdateRamEstimate(); 
 
@@ -4004,6 +4417,9 @@ namespace MultiCamRecorder
                     camera.ImagingControl.DeviceLost += (s, e) =>
                     {
                         LogCameraInfo($"Camera {cameraIndex + 1} DEVICE LOST!");
+                        // Update camera name label to show disconnected status
+                        camera.NameLabel.Text = $"{deviceName} [DISCONNECTED]";
+                        camera.NameLabel.ForeColor = System.Drawing.Color.Red;
                         if (isRecording)
                         {
                             MessageBox.Show($"WARNING: Camera {cameraIndex + 1} disconnected during recording!",
@@ -4039,7 +4455,9 @@ namespace MultiCamRecorder
             int requiredWidth = SIDE_MARGIN * 2 + (cameras.Count * (CAMERA_WIDTH + CAMERA_SPACING));
             if (requiredWidth > this.Width)
             {
-                this.Width = Math.Min(requiredWidth, 1920);
+                // Allow window to be wider than screen for horizontal scrolling
+                // Cap at reasonable maximum (5000px) to prevent excessive width
+                this.Width = Math.Min(requiredWidth, 5000);
             }
             
             UpdateRamEstimate();
@@ -4076,7 +4494,8 @@ namespace MultiCamRecorder
             // DON'T stop camera - let it run so Update button works in property dialog
 
             // Show settings dialog
-            using (CameraSettingsDialog dialog = new CameraSettingsDialog(camera.ImagingControl, camera.Settings, cameraIndex + 1))
+            string currentRecordingMode = cmbRecordingMode.SelectedItem?.ToString() ?? "";
+            using (CameraSettingsDialog dialog = new CameraSettingsDialog(camera.ImagingControl, camera.Settings, cameraIndex + 1, currentRecordingMode))
             {
                 if (dialog.ShowDialog() == DialogResult.OK)
                 {
@@ -4088,9 +4507,59 @@ namespace MultiCamRecorder
                     
                     bool needsRefresh = formatChanged || triggerModeChanged || fpsChanged;
                     
-                    // Save settings
+                    // Save settings for current camera
                     camera.Settings = dialog.Settings;
                     settings.CameraSettingsByDevice[camera.DeviceName] = dialog.Settings.Clone();
+                    
+                    // If "Save for All Cameras" was clicked, apply settings to all other cameras
+                    if (dialog.ApplyToAllCameras)
+                    {
+                        int appliedCount = 0;
+                        for (int i = 0; i < cameras.Count; i++)
+                        {
+                            if (i != cameraIndex) // Skip the current camera (already saved)
+                            {
+                                try
+                                {
+                                    var otherCamera = cameras[i];
+                                    
+                                    // Clone settings but keep the device name
+                                    var clonedSettings = dialog.Settings.Clone();
+                                    clonedSettings.DeviceName = otherCamera.DeviceName;
+                                    
+                                    // Apply settings to this camera
+                                    otherCamera.Settings = clonedSettings;
+                                    settings.CameraSettingsByDevice[otherCamera.DeviceName] = clonedSettings.Clone();
+                                    
+                                    // Apply VCD properties if camera is available
+                                    if (otherCamera.ImagingControl.DeviceValid)
+                                    {
+                                        try
+                                        {
+                                            if (!string.IsNullOrEmpty(clonedSettings.VCDPropertiesXml) && 
+                                                otherCamera.ImagingControl.VCDPropertyItems != null)
+                                            {
+                                                otherCamera.ImagingControl.VCDPropertyItems.Load(clonedSettings.VCDPropertiesXml);
+                                            }
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            LogCameraInfo($"Warning: Could not apply properties to camera {i + 1} ({otherCamera.DeviceName}): {ex.Message}");
+                                        }
+                                    }
+                                    
+                                    appliedCount++;
+                                }
+                                catch (Exception ex)
+                                {
+                                    LogCameraInfo($"Error applying settings to camera {i + 1}: {ex.Message}");
+                                }
+                            }
+                        }
+                        
+                        LogCameraInfo($"Applied settings from camera {cameraIndex + 1} to {appliedCount} other camera(s)");
+                    }
+                    
                     settings.Save();
 
                     if (needsRefresh)
@@ -4248,6 +4717,30 @@ namespace MultiCamRecorder
         {
             foreach (var camera in cameras)
             {
+                // Check camera connection status
+                bool isConnected = false;
+                try
+                {
+                    isConnected = camera.ImagingControl.DeviceValid;
+                }
+                catch { }
+
+                // Update camera name label with connection status
+                if (!isConnected && !camera.NameLabel.Text.Contains("[DISCONNECTED]"))
+                {
+                    camera.NameLabel.Text = $"{camera.DeviceName} [DISCONNECTED]";
+                    camera.NameLabel.ForeColor = System.Drawing.Color.Red;
+                }
+                else if (isConnected && camera.NameLabel.Text.Contains("[DISCONNECTED]"))
+                {
+                    camera.NameLabel.Text = camera.DeviceName;
+                    camera.NameLabel.ForeColor = System.Drawing.Color.Black;
+                }
+                else if (isConnected && camera.NameLabel.ForeColor == System.Drawing.Color.Red)
+                {
+                    camera.NameLabel.ForeColor = System.Drawing.Color.Black;
+                }
+
                 DateTime now = DateTime.Now;
                 double elapsedSeconds = (now - camera.LastFpsUpdate).TotalSeconds;
                 
@@ -4326,7 +4819,7 @@ namespace MultiCamRecorder
                         }
                         else
                         {
-                            camera.FpsLabel.Text = $"LIVE | {camera.Settings.SoftwareFrameRate:F1} fps (configured)";
+                            camera.FpsLabel.Text = $"LIVE | {camera.Settings.SoftwareFrameRate:F1} fps (software set)";
                         }
                         camera.FpsLabel.ForeColor = System.Drawing.Color.Green;
                     }
@@ -4381,10 +4874,28 @@ namespace MultiCamRecorder
             float aspectRatio = 4.0f / 3.0f; // Default 4:3
             try
             {
+                string? formatStr = null;
+                
+                // First try VideoFormatCurrent (if camera is running)
                 if (expandedCamera.ImagingControl.VideoFormatCurrent != null)
                 {
-                    string format = expandedCamera.ImagingControl.VideoFormatCurrent.ToString();
-                    var match = System.Text.RegularExpressions.Regex.Match(format, @"(\d+)x(\d+)");
+                    formatStr = expandedCamera.ImagingControl.VideoFormatCurrent.ToString();
+                }
+                // Fallback: Check VideoFormat (the format that's been set)
+                else if (expandedCamera.ImagingControl.VideoFormat != null)
+                {
+                    formatStr = expandedCamera.ImagingControl.VideoFormat.ToString();
+                }
+                // Also check saved settings
+                else if (expandedCamera.Settings != null && !string.IsNullOrEmpty(expandedCamera.Settings.Format))
+                {
+                    formatStr = expandedCamera.Settings.Format;
+                }
+                
+                // Parse resolution from format string
+                if (!string.IsNullOrEmpty(formatStr))
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(formatStr, @"(\d+)x(\d+)");
                     if (match.Success)
                     {
                         int camWidth = int.Parse(match.Groups[1].Value);
@@ -4437,9 +4948,43 @@ namespace MultiCamRecorder
             expandedCamera.FpsLabel.Size = new System.Drawing.Size(expandedWidth - 90, 20);
             expandedCamera.FpsLabel.Visible = true;
             
+            // Suspend form layout to prevent intermediate redraws
+            this.SuspendLayout();
+            
+            // Set size and location before making visible
             expandedCamera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 75);
             expandedCamera.ImagingControl.Size = new System.Drawing.Size(expandedWidth, expandedHeight);
+            
+            // Ensure LiveDisplay is enabled (required for proper rendering)
+            expandedCamera.ImagingControl.LiveDisplay = true;
+            
+            // CRITICAL: Set LiveDisplayDefault to false to allow custom sizing
+            // Then set LiveDisplayWidth and LiveDisplayHeight to match the control size
+            // This is especially important for Y800 format cameras which don't auto-resize
+            expandedCamera.ImagingControl.LiveDisplayDefault = false;
+            expandedCamera.ImagingControl.LiveDisplayWidth = expandedWidth;
+            expandedCamera.ImagingControl.LiveDisplayHeight = expandedHeight;
+            
             expandedCamera.ImagingControl.Visible = true;
+            expandedCamera.ImagingControl.BringToFront();
+            
+            // Resume form layout
+            this.ResumeLayout(false);
+            
+            // Force the control to refresh and update its display
+            expandedCamera.ImagingControl.Invalidate(true);
+            expandedCamera.ImagingControl.Refresh();
+            expandedCamera.ImagingControl.Update();
+            
+            // Force a layout update to ensure proper rendering
+            this.PerformLayout();
+            this.Invalidate(true);
+            this.Update();
+            
+            // Give the control time to process the resize, especially for Y800 format
+            Application.DoEvents();
+            System.Threading.Thread.Sleep(100);
+            Application.DoEvents();
             
             // Add "Back to Grid" label if not already present
             Label? backLabel = this.Controls.OfType<Label>().FirstOrDefault(l => l.Tag?.ToString() == "backToGrid");
@@ -4546,6 +5091,14 @@ namespace MultiCamRecorder
                 
                 camera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 68);
                 camera.ImagingControl.Size = new System.Drawing.Size(currentPreviewWidth, currentPreviewHeight);
+                
+                // CRITICAL: Set LiveDisplayDefault to false to allow custom sizing
+                // Then set LiveDisplayWidth and LiveDisplayHeight to match the control size
+                // This ensures the full camera view is scaled to fit, not just showing top-left corner
+                camera.ImagingControl.LiveDisplayDefault = false;
+                camera.ImagingControl.LiveDisplayWidth = currentPreviewWidth;
+                camera.ImagingControl.LiveDisplayHeight = currentPreviewHeight;
+                
                 camera.ImagingControl.Visible = true;
             }
             
@@ -4553,15 +5106,16 @@ namespace MultiCamRecorder
             int requiredWidth = SIDE_MARGIN * 2 + (camerasPerRow * (currentPreviewWidth + CAMERA_SPACING));
             int requiredHeight = TOP_MARGIN + (numRows * (currentPreviewHeight + 90)) + 50;
             
-            // Set minimum size but don't force it larger than screen
+            // Set minimum size (allow wider than screen for horizontal scrolling)
+            // Cap height to screen to prevent vertical overflow, but allow width to exceed screen
             this.MinimumSize = new System.Drawing.Size(
-                Math.Min(requiredWidth, Screen.PrimaryScreen.WorkingArea.Width),
+                Math.Min(requiredWidth, 5000), // Allow up to 5000px width for scrolling
                 Math.Min(requiredHeight, Screen.PrimaryScreen.WorkingArea.Height)
             );
             
             // Resize form if needed
             if (this.Width < requiredWidth)
-                this.Width = Math.Min(requiredWidth, Screen.PrimaryScreen.WorkingArea.Width);
+                this.Width = Math.Min(requiredWidth, 5000); // Allow wider than screen for scrolling
             if (this.Height < requiredHeight)
                 this.Height = Math.Min(requiredHeight, Screen.PrimaryScreen.WorkingArea.Height);
             
@@ -4614,6 +5168,9 @@ namespace MultiCamRecorder
                     txtWorkingFolder.Text = selectedPath;
                     settings.WorkingFolder = selectedPath;
                     settings.Save();
+                    
+                    // Update disk space display
+                    CheckDiskSpace();
                 }
             }
         }
@@ -4635,6 +5192,16 @@ namespace MultiCamRecorder
                     var camera = cameras[i];
                     try
                     {
+                        // Always set up a FrameHandlerSink for live preview to enable screenshots
+                        // Store the original sink (might be null) before setting up preview sink
+                        camera.OriginalSink = camera.ImagingControl.Sink;
+                        
+                        // Create a FrameHandlerSink for live preview (same as timelapse)
+                        var previewSink = new FrameHandlerSink();
+                        previewSink.SnapMode = false; // Grab mode (continuous)
+                        camera.ImagingControl.Sink = previewSink;
+                        
+                        // Now start live
                         camera.ImagingControl.LiveStart();
                         camera.LastFpsUpdate = DateTime.Now;
                         camera.FrameCount = 0;
@@ -4679,6 +5246,26 @@ namespace MultiCamRecorder
                     try
                     {
                         camera.ImagingControl.LiveStop();
+                        
+                        // Restore original sink (might be null) and dispose preview sink
+                        // Only dispose if it's not the same as OriginalSink (which might be needed for recording)
+                        var currentSink = camera.ImagingControl.Sink;
+                        if (currentSink is FrameHandlerSink previewSink && 
+                            camera.OriginalSink != previewSink)
+                        {
+                            // This was a preview sink that's not stored in OriginalSink, safe to dispose
+                            previewSink.Dispose();
+                        }
+                        
+                        // Restore original sink (might be null, or might be the preview sink if recording was active)
+                        camera.ImagingControl.Sink = camera.OriginalSink;
+                        
+                        // Only clear OriginalSink if we're not in recording mode
+                        // (During recording, OriginalSink holds the preview sink for screenshots)
+                        if (!isRecording)
+                        {
+                            camera.OriginalSink = null;
+                        }
                     }
                     catch { }
                 }
@@ -4708,7 +5295,7 @@ namespace MultiCamRecorder
                     return;
                 }
 
-                // Create Screenshots subfolder
+                // Create Screenshots subfolder (used as default location if save dialog is enabled)
                 string screenshotsFolder = Path.Combine(txtWorkingFolder.Text, "Screenshots");
                 Directory.CreateDirectory(screenshotsFolder);
 
@@ -4717,6 +5304,7 @@ namespace MultiCamRecorder
                 
                 int savedCount = 0;
                 List<string> errors = new List<string>();
+                bool showSaveDialog = settings.ShowScreenshotSaveDialog;
 
                 foreach (var camera in cameras)
                 {
@@ -4726,36 +5314,78 @@ namespace MultiCamRecorder
                         {
                             ImageBuffer? imageBuffer = null;
                             
-                            // Try to get image buffer from appropriate source
+                            // Try multiple methods to get image buffer, depending on current mode
+                            
+                            // Method 1: If using FrameHandlerSink (loop recording, timelapse, or live preview)
+                            // Note: Live preview now always uses FrameHandlerSink, so this should always work
                             if (camera.ImagingControl.Sink is FrameHandlerSink frameHandlerSink)
                             {
-                                // Preview mode - using FrameHandlerSink
                                 imageBuffer = frameHandlerSink.LastAcquiredBuffer;
                             }
+                            // Method 2: If recording with MediaStreamSink, try original sink (FrameHandlerSink from preview)
                             else if (camera.OriginalSink is FrameHandlerSink originalFrameHandlerSink)
                             {
-                                // Recording mode - the original sink was stored before recording
                                 imageBuffer = originalFrameHandlerSink.LastAcquiredBuffer;
+                            }
+                            // Method 3: Fallback - try ImageActiveBuffer (for MediaStreamSink recording)
+                            else
+                            {
+                                imageBuffer = camera.ImagingControl.ImageActiveBuffer;
                             }
                             
                             if (imageBuffer != null)
                             {
-                                // Generate filename with camera name or number
-                                string cameraName = string.IsNullOrWhiteSpace(camera.CustomName) 
-                                    ? $"Camera{cameras.IndexOf(camera) + 1}" 
-                                    : camera.CustomName.Replace(" ", "_");
-                                
-                                string filename = $"{timestamp}_{cameraName}.png";
-                                string filepath = Path.Combine(screenshotsFolder, filename);
-                                
-                                // Create bitmap and save as PNG
-                                var bitmap = imageBuffer.CreateBitmapWrap();
-                                using (System.Drawing.Bitmap clone = new System.Drawing.Bitmap(bitmap))
+                                try
                                 {
-                                    clone.Save(filepath, System.Drawing.Imaging.ImageFormat.Png);
+                                    // Generate filename with camera name or number
+                                    string cameraName = string.IsNullOrWhiteSpace(camera.CustomName) 
+                                        ? $"Camera{cameras.IndexOf(camera) + 1}" 
+                                        : camera.CustomName.Replace(" ", "_");
+                                    
+                                    string filename = $"{timestamp}_{cameraName}.png";
+                                    string filepath = Path.Combine(screenshotsFolder, filename);
+                                    
+                                    // If save dialog is enabled, show dialog for each camera
+                                    if (showSaveDialog)
+                                    {
+                                        using (SaveFileDialog saveDialog = new SaveFileDialog())
+                                        {
+                                            saveDialog.Filter = "PNG Image|*.png|All Files|*.*";
+                                            saveDialog.FileName = filename;
+                                            saveDialog.InitialDirectory = screenshotsFolder;
+                                            saveDialog.Title = $"Save Screenshot - {cameraName}";
+                                            
+                                            if (saveDialog.ShowDialog(this) == DialogResult.OK)
+                                            {
+                                                filepath = saveDialog.FileName;
+                                            }
+                                            else
+                                            {
+                                                // User cancelled this camera's screenshot
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Create bitmap and save as PNG
+                                    var bitmap = imageBuffer.CreateBitmapWrap();
+                                    if (bitmap != null && bitmap.Width > 0 && bitmap.Height > 0)
+                                    {
+                                        using (System.Drawing.Bitmap clone = new System.Drawing.Bitmap(bitmap))
+                                        {
+                                            clone.Save(filepath, System.Drawing.Imaging.ImageFormat.Png);
+                                        }
+                                        savedCount++;
+                                    }
+                                    else
+                                    {
+                                        errors.Add($"Camera {cameras.IndexOf(camera) + 1}: Invalid bitmap (empty or zero size)");
+                                    }
                                 }
-                                
-                                savedCount++;
+                                catch (Exception ex)
+                                {
+                                    errors.Add($"Camera {cameras.IndexOf(camera) + 1}: Error saving bitmap - {ex.Message}");
+                                }
                             }
                             else
                             {
@@ -4769,22 +5399,31 @@ namespace MultiCamRecorder
                     }
                 }
 
-                // Show result
-                if (savedCount > 0)
+                // Show result (only if save dialog is disabled, or if there were errors)
+                if (!showSaveDialog)
                 {
-                    string message = $"✅ Saved {savedCount} screenshot(s) to:\n{screenshotsFolder}";
-                    if (errors.Count > 0)
+                    if (savedCount > 0)
                     {
-                        message += $"\n\n⚠️ Errors:\n{string.Join("\n", errors)}";
+                        string message = $"✅ Saved {savedCount} screenshot(s) to:\n{screenshotsFolder}";
+                        if (errors.Count > 0)
+                        {
+                            message += $"\n\n⚠️ Errors:\n{string.Join("\n", errors)}";
+                        }
+                        MessageBox.Show(message, "Screenshots Saved", 
+                                    MessageBoxButtons.OK, MessageBoxIcon.Information);
                     }
-                    MessageBox.Show(message, "Screenshots Saved", 
-                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    else
+                    {
+                        MessageBox.Show("❌ No screenshots captured!\n\n" +
+                                    (errors.Count > 0 ? string.Join("\n", errors) : "Make sure cameras are running."),
+                                    "Screenshot Failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
                 }
-                else
+                else if (errors.Count > 0)
                 {
-                    MessageBox.Show("❌ No screenshots captured!\n\n" +
-                                (errors.Count > 0 ? string.Join("\n", errors) : "Make sure cameras are running."),
-                                "Screenshot Failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    // If save dialog is enabled, only show errors
+                    MessageBox.Show($"⚠️ Errors:\n{string.Join("\n", errors)}",
+                                "Screenshot Errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             }
             catch (Exception ex)
@@ -4896,10 +5535,12 @@ namespace MultiCamRecorder
                             if (camera.Settings.UseExternalTrigger)
                             {
                                 expectedFps = (double)numExternalTriggerFps.Value;  // ← Use user-specified value
+                                LogCameraInfo($"{camera.CustomName}: Using External Trigger mode - Expected FPS: {expectedFps} (from 'Expected FPS' control)");
                             }
                             else
                             {
                                 expectedFps = camera.Settings.SoftwareFrameRate;
+                                LogCameraInfo($"{camera.CustomName}: Using Software Frame Rate: {expectedFps} fps");
                             }
                             
                             camera.MaxLoopFrames = (int)(loopDurationSeconds * expectedFps);
@@ -4977,6 +5618,14 @@ namespace MultiCamRecorder
                                                     // DEEP clone bitmap with complete memory independence
                                                     System.Drawing.Bitmap clonedFrame = DeepCloneBitmap(bitmap);
                                                     
+                                                    // Apply date/time overlay if enabled
+                                                    if (cameras[cameraIndex].Settings.ShowDate || cameras[cameraIndex].Settings.ShowTime)
+                                                    {
+                                                        System.Drawing.Bitmap overlayFrame = ApplyDateTimeOverlay(clonedFrame, cameras[cameraIndex].Settings, DateTime.Now);
+                                                        clonedFrame.Dispose(); // Dispose original
+                                                        clonedFrame = overlayFrame;
+                                                    }
+                                                    
                                                     // Add to buffer
                                                     cameras[cameraIndex].LoopBuffer!.Enqueue(clonedFrame);
                                                     
@@ -5029,7 +5678,24 @@ namespace MultiCamRecorder
                         }
                         else
                         {
-                            // Normal recording - use file sink
+                            // Normal recording - check if Y800 format (requires FrameHandlerSink)
+                            // Log current format for debugging
+                            string currentFormatStr = "Unknown";
+                            try
+                            {
+                                if (camera.ImagingControl.VideoFormatCurrent != null)
+                                    currentFormatStr = camera.ImagingControl.VideoFormatCurrent.ToString();
+                                else if (camera.ImagingControl.VideoFormat != null)
+                                    currentFormatStr = camera.ImagingControl.VideoFormat.ToString();
+                                else if (camera.Settings != null && !string.IsNullOrEmpty(camera.Settings.Format))
+                                    currentFormatStr = camera.Settings.Format;
+                            }
+                            catch { }
+                            
+                            LogCameraInfo($"Camera {i + 1}: Checking format - Current: {currentFormatStr}");
+                            
+                            // All formats: Use MediaStreamSink (preserves quality)
+                            // Overlay will be applied during conversion/trimming using FFmpeg
                             string safeName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
                             if (string.IsNullOrWhiteSpace(safeName))
                                 safeName = $"Camera{i + 1}";
@@ -5040,7 +5706,7 @@ namespace MultiCamRecorder
                             camera.RecordingFilePath = aviFilename;
                             camera.ImagingControl.Sink = new MediaStreamSink((AviCompressor?)null, aviFilename);
                             
-                            LogCameraInfo($"Camera {i + 1} sink configured: {aviFilename}");
+                            LogCameraInfo($"Camera {i + 1} recording mode configured: {aviFilename}");
                         }
                     }
                     catch (Exception ex)
@@ -5130,7 +5796,28 @@ namespace MultiCamRecorder
                                                     string frameNumber = camera.TimelapseFrameCount.ToString("D6");
                                                     string imagePath = Path.Combine(cameraFolder, $"{currentRecordingBaseName}_{cameraName}_{frameNumber}.png");
                                                     
-                                                    clone.Save(imagePath, System.Drawing.Imaging.ImageFormat.Png);
+                                                    // Apply date/time overlay if enabled
+                                                    System.Drawing.Bitmap finalBitmap = clone;
+                                                    bool overlayApplied = false;
+                                                    if (camera.Settings.ShowDate || camera.Settings.ShowTime)
+                                                    {
+                                                        finalBitmap = ApplyDateTimeOverlay(clone, camera.Settings, now);
+                                                        overlayApplied = true;
+                                                    }
+                                                    
+                                                    try
+                                                    {
+                                                        finalBitmap.Save(imagePath, System.Drawing.Imaging.ImageFormat.Png);
+                                                    }
+                                                    finally
+                                                    {
+                                                        // Dispose overlay bitmap if it was created
+                                                        if (overlayApplied && finalBitmap != clone)
+                                                        {
+                                                            finalBitmap.Dispose();
+                                                        }
+                                                    }
+                                                    
                                                     camera.TimelapseImagePaths!.Add(imagePath);
                                                     camera.TimelapseFrameCount++;
                                                     camera.LastTimelapseCapture = now;
@@ -5152,16 +5839,28 @@ namespace MultiCamRecorder
                         LogCameraInfo("Timelapse capture timer started");
                     }
 
-                    if (chkMaxDuration.Checked)
+                    // Check max duration from settings
+                    if (settings.MaxDurationEnabled)
                     {
                         // Convert max duration to minutes based on selected unit
-                        int maxMinutes = (int)numMaxMinutes.Value;
-                        string durationUnit = cmbMaxDurationUnit.SelectedItem?.ToString() ?? "minutes";
+                        int maxDurationValue = settings.MaxDurationValue;
+                        string durationUnit = settings.MaxDurationUnit;
+                        int maxMinutes = maxDurationValue;
                         
                         if (durationUnit == "hours")
-                            maxMinutes = maxMinutes * 60;
+                            maxMinutes = maxDurationValue * 60;
                         else if (durationUnit == "days")
-                            maxMinutes = maxMinutes * 60 * 24;
+                            maxMinutes = maxDurationValue * 60 * 24;
+                        
+                        // Format duration string for display
+                        string durationDisplay = $"{maxDurationValue} {durationUnit}";
+                        if (maxDurationValue == 1)
+                        {
+                            // Remove 's' for singular
+                            durationDisplay = durationDisplay.Replace("minutes", "minute")
+                                                             .Replace("hours", "hour")
+                                                             .Replace("days", "day");
+                        }
                         
                         DateTime recordingStart = DateTime.Now;
                         
@@ -5180,13 +5879,13 @@ namespace MultiCamRecorder
                             if (elapsedMinutes >= maxMinutes)
                             {
                                 maxDurationTimer.Stop();
-                                LogCameraInfo($"Max duration reached ({maxMinutes} minutes) - stopping recording automatically");
+                                LogCameraInfo($"Max duration reached ({durationDisplay}) - stopping recording automatically");
                                 
                                 // Auto-stop recording
                                 this.Invoke(new Action(() =>
                                 {
                                     BtnStopRecording_Click(null, EventArgs.Empty);
-                                    MessageBox.Show($"Recording automatically stopped after {maxMinutes} minute(s).",
+                                    MessageBox.Show($"Recording automatically stopped after {durationDisplay}.",
                                                     "Max Duration Reached", MessageBoxButtons.OK, MessageBoxIcon.Information);
                                 }));
                                 
@@ -5195,7 +5894,7 @@ namespace MultiCamRecorder
                         };
                         maxDurationTimer.Start();
                         
-                        LogCameraInfo($"Max duration monitoring enabled: {maxMinutes} minutes");
+                        LogCameraInfo($"Max duration monitoring enabled: {durationDisplay}");
                     }
                 }
                 
@@ -5221,6 +5920,121 @@ namespace MultiCamRecorder
             StopRecording();
         }
 
+        /// <summary>
+        /// Generates a JSON timestamp file for a video, mapping frame numbers to timestamps.
+        /// </summary>
+        private void GenerateTimestampFile(string videoFile, DateTime recordingStartTime, double fps, int? cameraIndex = null)
+        {
+            // Check if JSON generation is enabled for this camera
+            if (cameraIndex.HasValue && cameraIndex.Value < cameras.Count)
+            {
+                if (!cameras[cameraIndex.Value].Settings.GenerateJsonTimestamps)
+                {
+                    return; // JSON generation disabled for this camera
+                }
+            }
+            
+            try
+            {
+                // Get video information
+                int frameCount = GetVideoFrameCount(videoFile);
+                if (frameCount == 0)
+                {
+                    LogCameraInfo($"Warning: Could not determine frame count for {Path.GetFileName(videoFile)}, skipping timestamp file generation");
+                    return;
+                }
+                
+                double videoFps = GetVideoFrameRate(videoFile);
+                if (videoFps <= 0)
+                    videoFps = fps; // Use provided FPS as fallback
+                
+                // Get video resolution
+                int width = 0, height = 0;
+                try
+                {
+                    using (var capture = new VideoCapture(videoFile))
+                    {
+                        width = (int)capture.Get(VideoCaptureProperties.FrameWidth);
+                        height = (int)capture.Get(VideoCaptureProperties.FrameHeight);
+                    }
+                }
+                catch { }
+                
+                // Get file info
+                FileInfo fileInfo = new FileInfo(videoFile);
+                long fileSize = fileInfo.Length;
+                DateTime fileCreated = fileInfo.CreationTime;
+                DateTime fileModified = fileInfo.LastWriteTime;
+                
+                // Build JSON structure
+                var timestampData = new
+                {
+                    metadata = new
+                    {
+                        videoFile = Path.GetFileName(videoFile),
+                        videoPath = videoFile,
+                        recordingStartTime = recordingStartTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                        recordingStartTimeLocal = recordingStartTime.ToString("yyyy-MM-ddTHH:mm:ss.fff"),
+                        frameCount = frameCount,
+                        frameRate = videoFps,
+                        durationSeconds = frameCount / videoFps,
+                        resolution = new { width = width, height = height },
+                        fileSizeBytes = fileSize,
+                        fileCreated = fileCreated.ToString("yyyy-MM-ddTHH:mm:ss.fff"),
+                        fileModified = fileModified.ToString("yyyy-MM-ddTHH:mm:ss.fff"),
+                        cameraIndex = cameraIndex,
+                        generatedAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                        generatedAtLocal = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss.fff")
+                    },
+                    frames = new List<object>()
+                };
+                
+                // Generate timestamp for each frame (1-based)
+                for (int frameNum = 1; frameNum <= frameCount; frameNum++)
+                {
+                    // Calculate timestamp: recording start + (frame number - 1) / fps
+                    // Frame 1 is at recording start time
+                    double secondsOffset = (frameNum - 1) / fps;
+                    DateTime frameTimestamp = recordingStartTime.AddSeconds(secondsOffset);
+                    
+                    // Calculate Unix timestamp
+                    DateTime epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                    long unixTimestamp = (long)(frameTimestamp.ToUniversalTime() - epoch).TotalSeconds;
+                    double unixTimestampMs = (frameTimestamp.ToUniversalTime() - epoch).TotalMilliseconds;
+                    
+                    var frameData = new
+                    {
+                        frameNumber = frameNum, // 1-based
+                        timestamp = frameTimestamp.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"), // ISO 8601 UTC
+                        timestampLocal = frameTimestamp.ToString("yyyy-MM-ddTHH:mm:ss.fff"), // Local time
+                        date = frameTimestamp.ToString("yyyy-MM-dd"), // Date only
+                        time = frameTimestamp.ToString("HH:mm:ss"), // Time only (no milliseconds)
+                        timeWithMs = frameTimestamp.ToString("HH:mm:ss.fff"), // Time with milliseconds
+                        unixTimestamp = unixTimestamp, // Unix timestamp in seconds
+                        unixTimestampMs = unixTimestampMs, // Unix timestamp in milliseconds
+                        secondsFromStart = secondsOffset // Seconds elapsed since recording start
+                    };
+                    
+                    timestampData.frames.Add(frameData);
+                }
+                
+                // Write JSON file
+                string jsonFile = Path.ChangeExtension(videoFile, ".json");
+                string json = System.Text.Json.JsonSerializer.Serialize(timestampData, new System.Text.Json.JsonSerializerOptions
+                {
+                    WriteIndented = true,
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                });
+                
+                File.WriteAllText(jsonFile, json);
+                LogCameraInfo($"Generated timestamp file: {Path.GetFileName(jsonFile)} ({frameCount} frames)");
+            }
+            catch (Exception ex)
+            {
+                LogCameraInfo($"Error generating timestamp file for {Path.GetFileName(videoFile)}: {ex.Message}");
+            }
+        }
+        
         private int GetVideoFrameCount(string videoFile)
         {
             try
@@ -5605,6 +6419,9 @@ namespace MultiCamRecorder
                             }
                             string filename = Path.GetFileName(aviFile);
                             frameStats.Add((filename, frameCount, actualDuration));
+                            
+                            // Note: JSON timestamp files are generated when files are saved/converted,
+                            // not for the original temporary recording files
                         }
                     }
 
@@ -5691,30 +6508,57 @@ namespace MultiCamRecorder
                 if (camera.Settings.UseExternalTrigger)
                 {
                     fps = (double)numExternalTriggerFps.Value;
+                    LogCameraInfo($"  Using External Trigger FPS: {fps} fps (from numExternalTriggerFps control)");
                 }
                 else
                 {
                     fps = camera.Settings.SoftwareFrameRate;
+                    LogCameraInfo($"  Using Software Frame Rate: {fps} fps (from camera settings)");
                 }
+                
+                LogCameraInfo($"  Saving {frames.Count} frames at {fps} fps");
                 
                 // Use OpenCvSharp to write frames to AVI
                 using (var writer = new OpenCvSharp.VideoWriter())
                 {
-                    // Use MJPG codec (more compatible than DIB, works for both grayscale and color)
-                    // MJPG = Motion JPEG, widely supported
-                    int fourcc = OpenCvSharp.FourCC.MJPG;
+                    // Try uncompressed codecs first for best quality (matching MediaStreamSink with null compressor)
+                    // DIB = Device Independent Bitmap (uncompressed RGB) - matches MediaStreamSink behavior
+                    // Y800 = uncompressed grayscale
+                    int fourcc;
+                    string codecName;
+                    if (isColor)
+                    {
+                        // For color: Try DIB (uncompressed RGB) first, fallback to MJPG if not available
+                        fourcc = OpenCvSharp.FourCC.FromString("DIB ");
+                        codecName = "DIB (uncompressed RGB)";
+                    }
+                    else
+                    {
+                        // For grayscale: Use Y800 (uncompressed grayscale) or DIB
+                        fourcc = OpenCvSharp.FourCC.FromString("Y800");
+                        codecName = "Y800 (uncompressed grayscale)";
+                    }
                     
                     // Open video writer with correct color flag
                     bool opened = writer.Open(outputPath, fourcc, fps, new OpenCvSharp.Size(width, height), isColor);
                     
+                    // Fallback to MJPG if uncompressed codec fails (lossy but widely supported)
+                    if (!opened)
+                    {
+                        LogCameraInfo($"Uncompressed codec not available, trying MJPG (lossy compression)");
+                        fourcc = OpenCvSharp.FourCC.MJPG;
+                        codecName = "MJPG (lossy)";
+                        opened = writer.Open(outputPath, fourcc, fps, new OpenCvSharp.Size(width, height), isColor);
+                    }
+                    
                     if (!opened)
                     {
                         LogCameraInfo($"ERROR: Could not open video writer for {outputPath}");
-                        LogCameraInfo($"  Tried: MJPG codec, {width}x{height}, {fps} fps, isColor={isColor}");
+                        LogCameraInfo($"  Tried: Uncompressed and MJPG codecs, {width}x{height}, {fps} fps, isColor={isColor}");
                         return;
                     }
                     
-                    LogCameraInfo($"Video writer opened successfully");
+                    LogCameraInfo($"Video writer opened successfully with codec: {codecName}");
                     
                     // Write all frames
                     int frameCount = 0;
@@ -5812,7 +6656,7 @@ namespace MultiCamRecorder
                     List<string> newAviFiles = new List<string>();
                     for (int i = 0; i < aviFiles.Count; i++)
                     {
-                        string newAviPath = Path.Combine(outputPath, $"{outputFilename}_Camera{i + 1}.avi");
+                        string newAviPath = Path.Combine(outputPath, $"{outputFilename}_Camera{i + 1}_AVI.avi");
                         newAviFiles.Add(newAviPath);
                     }
                     ConvertAvisToMp4(newAviFiles, outputPath, outputFilename, fps, deleteOriginals: false);
@@ -5870,7 +6714,8 @@ namespace MultiCamRecorder
                     List<string> newAviFiles = new List<string>();
                     for (int i = 0; i < aviFiles.Count; i++)
                     {
-                        string newAviPath = Path.Combine(outputPath, $"{outputFilename}_{customNames[i]}.avi");
+                        string cameraName = string.Join("_", customNames[i].Split(Path.GetInvalidFileNameChars()));
+                        string newAviPath = Path.Combine(outputPath, $"{outputFilename}_{cameraName}_AVI.avi");
                         newAviFiles.Add(newAviPath);
                     }
                     
@@ -5975,8 +6820,8 @@ namespace MultiCamRecorder
                 cameraName = string.Join("_", cameraName.Split(Path.GetInvalidFileNameChars()));
 
                 // Use a temporary output file first, then rename
-                string finalOutputAvi = Path.Combine(outputPath, $"{outputFilename}_{cameraName}.avi");
-                string tempOutputAvi = Path.Combine(outputPath, $"temp_{outputFilename}_{cameraName}.avi");
+                string finalOutputAvi = Path.Combine(outputPath, $"{outputFilename}_{cameraName}_AVI.avi");
+                string tempOutputAvi = Path.Combine(outputPath, $"temp_{outputFilename}_{cameraName}_AVI.avi");
 
                 statusLabel.Text = $"Processing {i + 1} of {aviFiles.Count}: {cameraName}";
                 Application.DoEvents();
@@ -6006,22 +6851,72 @@ namespace MultiCamRecorder
                     // For RGB/color formats, re-encode to ensure compatibility
                     // For grayscale (Y800), use stream copy for speed but fix frame rate with setpts
                     string videoCodec;
-                    string filterComplex = "";
+                    string videoFilter = "";
+
+                    // Get camera settings for overlay (match by index)
+                    CameraSettings? cameraSettings = null;
+                    DateTime? recordingStartTime = null;
+                    int videoHeight = 480; // Default
+                    
+                    if (i < cameras.Count)
+                    {
+                        cameraSettings = cameras[i].Settings;
+                        recordingStartTime = cameras[i].RecordingStartTime;
+                        
+                        // Get video height for font scaling
+                        try
+                        {
+                            using (var capture = new VideoCapture(aviFile))
+                            {
+                                videoHeight = (int)capture.Get(VideoCaptureProperties.FrameHeight);
+                            }
+                        }
+                        catch { }
+                    }
+                    
+                    // Build overlay filter if needed
+                    string overlayFilter = "";
+                    if (cameraSettings != null && recordingStartTime.HasValue && 
+                        (cameraSettings.ShowDate || cameraSettings.ShowTime))
+                    {
+                        overlayFilter = BuildFFmpegDateTimeOverlayFilter(cameraSettings, recordingStartTime.Value, videoHeight);
+                    }
 
                     if (pixelFormat.Contains("bgr") || pixelFormat.Contains("rgb") || pixelFormat.Contains("bgra") || pixelFormat.Contains("rgba"))
                     {
                         // Color format - re-encode to ensure compatibility
                         videoCodec = "-c:v rawvideo -pix_fmt bgr24";
                         LogCameraInfo($"Using re-encoding for color format: {pixelFormat}");
+                        
+                        // Build video filter chain
+                        List<string> filters = new List<string>();
+                        if (!string.IsNullOrEmpty(overlayFilter))
+                        {
+                            filters.Add(overlayFilter);
+                        }
+                        if (filters.Count > 0)
+                        {
+                            videoFilter = $"-vf \"{string.Join(",", filters)}\"";
+                        }
                     }
                     else
                     {
-                        // Grayscale - use stream copy for speed
-                        videoCodec = "-c:v copy";
-                        LogCameraInfo($"Using stream copy for format: {pixelFormat}");
+                        // Grayscale - use stream copy for speed, but need to re-encode if overlay is needed
+                        if (!string.IsNullOrEmpty(overlayFilter))
+                        {
+                            // Need to re-encode to apply overlay
+                            videoCodec = "-c:v rawvideo -pix_fmt gray";
+                            videoFilter = $"-vf \"{overlayFilter}\"";
+                            LogCameraInfo($"Using re-encoding with overlay for grayscale format: {pixelFormat}");
+                        }
+                        else
+                        {
+                            videoCodec = "-c:v copy";
+                            LogCameraInfo($"Using stream copy for format: {pixelFormat}");
+                        }
                     }
 
-                    string ffmpegArgs = $"-fflags +genpts -i \"{aviFile}\" -ss {startTime:F6} -t {duration:F6} {videoCodec} -r {fps:F3} -avoid_negative_ts make_zero -an -y \"{tempOutputAvi}\"";
+                    string ffmpegArgs = $"-fflags +genpts -i \"{aviFile}\" -ss {startTime:F6} -t {duration:F6} {videoCodec} {videoFilter} -r {fps:F3} -avoid_negative_ts make_zero -an -y \"{tempOutputAvi}\"";
 
                     LogCameraInfo($"FFmpeg command: ffmpeg {ffmpegArgs}");
                     
@@ -6080,6 +6975,14 @@ namespace MultiCamRecorder
                                 // ✅ NEW: Delete original input file, then rename temp to final
                                 File.Delete(aviFile);
                                 File.Move(tempOutputAvi, finalOutputAvi);
+                                
+                                // Generate timestamp file for the trimmed AVI (after rename, so it matches final filename)
+                                if (recordingStartTime.HasValue)
+                                {
+                                    // Adjust recording start time based on trim start frame
+                                    DateTime adjustedStartTime = recordingStartTime.Value.AddSeconds(startTime);
+                                    GenerateTimestampFile(finalOutputAvi, adjustedStartTime, fps, i < cameras.Count ? i : null);
+                                }
                                 
                                 successCount++;
                                 LogCameraInfo($"Successfully trimmed {filename} -> {Path.GetFileName(finalOutputAvi)}");
@@ -6236,7 +7139,7 @@ namespace MultiCamRecorder
                 string cameraName = (customNames != null && i < customNames.Count) ? customNames[i] : $"Camera{i + 1}";
                 // Sanitize the camera name to remove any invalid characters
                 cameraName = string.Join("_", cameraName.Split(Path.GetInvalidFileNameChars()));
-                string mp4File = Path.Combine(outputPath, $"{outputFilename}_{cameraName}.mp4");
+                string mp4File = Path.Combine(outputPath, $"{outputFilename}_{cameraName}_MP4.mp4");
 
                 statusLabel.Text = $"Converting {i + 1} of {aviFiles.Count}";
                 currentFileLabel.Text = $"File: {fileName}";
@@ -6263,19 +7166,68 @@ namespace MultiCamRecorder
                     statusLabel.Text = $"Converting {i + 1} of {aviFiles.Count} - Frames: {startFrame}-{endFrame}";
                     Application.DoEvents();
 
+                    // Get camera settings for overlay (match by index)
+                    CameraSettings? cameraSettings = null;
+                    DateTime? recordingStartTime = null;
+                    int videoHeight = 480; // Default
+                    
+                    if (i < cameras.Count)
+                    {
+                        cameraSettings = cameras[i].Settings;
+                        recordingStartTime = cameras[i].RecordingStartTime;
+                        
+                        // Get video height for font scaling
+                        try
+                        {
+                            using (var capture = new VideoCapture(aviFile))
+                            {
+                                videoHeight = (int)capture.Get(VideoCaptureProperties.FrameHeight);
+                            }
+                        }
+                        catch { }
+                    }
+                    
+                    // Build overlay filter if needed
+                    string overlayFilter = "";
+                    if (cameraSettings != null && recordingStartTime.HasValue && 
+                        (cameraSettings.ShowDate || cameraSettings.ShowTime))
+                    {
+                        try
+                        {
+                            overlayFilter = BuildFFmpegDateTimeOverlayFilter(cameraSettings, recordingStartTime.Value, videoHeight);
+                            LogCameraInfo($"Built overlay filter for {cameraName}: {overlayFilter}");
+                        }
+                        catch (Exception ex)
+                        {
+                            LogCameraInfo($"Error building overlay filter: {ex.Message}");
+                            overlayFilter = ""; // Disable overlay if filter build fails
+                        }
+                    }
+                    
+                    // Build video filter chain
+                    string videoFilterChain;
+                    if (!string.IsNullOrEmpty(overlayFilter))
+                    {
+                        // Combine FPS filter and overlay filter
+                        videoFilterChain = $"setpts=N/(TB*{fps:F6}),{overlayFilter}";
+                    }
+                    else
+                    {
+                        // Just FPS filter
+                        videoFilterChain = $"setpts=N/(TB*{fps:F6})";
+                    }
+                    
                     // FFmpeg command with trimming and encoding
-                    string fpsFilter = $"setpts=N/(TB*{fps:F6})";
                     ProcessStartInfo startInfo = new ProcessStartInfo
                     {
                         FileName = FFMPEG_PATH,
-                        Arguments = $"-ss {startTime_sec:F6} -i \"{aviFile}\" -t {duration:F6} -vf \"{fpsFilter}\" -c:v libx264 -pix_fmt yuv420p -preset ultrafast -crf 23 -r {fps:F3} -progress pipe:1 -y \"{mp4File}\"",
+                        Arguments = $"-ss {startTime_sec:F6} -i \"{aviFile}\" -t {duration:F6} -vf \"{videoFilterChain}\" -c:v libx264 -pix_fmt yuv420p -preset ultrafast -crf 23 -r {fps:F3} -progress pipe:1 -y \"{mp4File}\"",
                         UseShellExecute = false,
                         CreateNoWindow = true,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true
                     };
 
-                    bool conversionComplete = false;
                     string lastError = "";
 
                     using (Process process = Process.Start(startInfo)!)
@@ -6306,10 +7258,6 @@ namespace MultiCamRecorder
                                                 }));
                                             }
                                         }
-                                    }
-                                    else if (e.Data.StartsWith("progress=end"))
-                                    {
-                                        conversionComplete = true;
                                     }
                                 }
                                 catch { }
@@ -7418,7 +8366,7 @@ namespace MultiCamRecorder
                 if (!File.Exists(aviFile))
                     continue;
 
-                string outputAvi = Path.Combine(outputPath, $"{outputFilename}_Camera{i + 1}.avi");
+                string outputAvi = Path.Combine(outputPath, $"{outputFilename}_Camera{i + 1}_AVI.avi");
                 
                 statusLabel.Text = $"Processing {i + 1} of {aviFiles.Count}...";
                 Application.DoEvents();
@@ -7577,7 +8525,7 @@ namespace MultiCamRecorder
                 else
                 {
                     // Recording conversion: use output path and filename
-                    string outputFileName = $"{outputFilename}_Camera{i + 1}.mp4";  // ← Use different variable name
+                    string outputFileName = $"{outputFilename}_Camera{i + 1}_MP4.mp4";  // ← Use different variable name
                     mp4File = Path.Combine(outputPath, outputFileName);
                 }
 
@@ -7639,7 +8587,6 @@ namespace MultiCamRecorder
                         RedirectStandardError = true
                     };
 
-                    bool conversionComplete = false;
                     string lastError = "";
 
                     using (Process process = Process.Start(startInfo)!)
@@ -7671,10 +8618,6 @@ namespace MultiCamRecorder
                                                 }));
                                             }
                                         }
-                                    }
-                                    else if (e.Data.StartsWith("progress=end"))
-                                    {
-                                        conversionComplete = true;
                                     }
                                 }
                                 catch { }
@@ -7799,6 +8742,9 @@ namespace MultiCamRecorder
 
         private void MonitorDiskWriteSpeed()
         {
+            // Always check disk space, not just when recording
+            CheckDiskSpace();
+
             if (!isRecording)
                 return;
 
@@ -7829,6 +8775,98 @@ namespace MultiCamRecorder
             }
 
             lastTotalBytesWritten = totalBytes;
+        }
+
+        private void CheckDiskSpace()
+        {
+            try
+            {
+                string workingFolder = txtWorkingFolder.Text;
+                if (string.IsNullOrEmpty(workingFolder) || !Directory.Exists(workingFolder))
+                    return;
+
+                DriveInfo driveInfo = new DriveInfo(Path.GetPathRoot(workingFolder)!);
+                if (!driveInfo.IsReady)
+                    return;
+
+                long freeSpaceBytes = driveInfo.AvailableFreeSpace;
+                long totalSpaceBytes = driveInfo.TotalSize;
+                double freeSpaceGB = freeSpaceBytes / (1024.0 * 1024.0 * 1024.0);
+                double totalSpaceGB = totalSpaceBytes / (1024.0 * 1024.0 * 1024.0);
+                double usedPercent = ((totalSpaceBytes - freeSpaceBytes) / (double)totalSpaceBytes) * 100.0;
+
+                // Update disk space label
+                if (lblDiskSpace != null)
+                {
+                    this.Invoke(new Action(() =>
+                    {
+                        lblDiskSpace.Text = $"Disk Space: {freeSpaceGB:F1} GB free [{usedPercent:F1}% used]";
+                        if (usedPercent > 90)
+                        {
+                            lblDiskSpace.ForeColor = System.Drawing.Color.Red;
+                        }
+                        else if (usedPercent > 75)
+                        {
+                            lblDiskSpace.ForeColor = System.Drawing.Color.Orange;
+                        }
+                        else
+                        {
+                            lblDiskSpace.ForeColor = System.Drawing.Color.Gray;
+                        }
+                    }));
+                }
+
+                // Check thresholds
+                if (isRecording)
+                {
+                    // Critical: Less than 1 GB free - auto-stop
+                    if (freeSpaceGB < 1.0)
+                    {
+                        this.Invoke(new Action(() =>
+                        {
+                            BtnStopRecording_Click(null, EventArgs.Empty);
+                            MessageBox.Show(
+                                $"⚠️ CRITICAL: Disk space is critically low ({freeSpaceGB:F2} GB free)!\n\n" +
+                                "Recording has been automatically stopped to prevent data loss.\n\n" +
+                                "Please free up disk space before recording again.",
+                                "Disk Full - Recording Stopped",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Error);
+                        }));
+                        LogCameraInfo($"CRITICAL: Disk space critically low ({freeSpaceGB:F2} GB) - auto-stopped recording");
+                    }
+                    // Warning: Less than 5 GB free - show warning once
+                    else if (freeSpaceGB < 5.0 && !diskSpaceWarningShown)
+                    {
+                        diskSpaceWarningShown = true;
+                        this.Invoke(new Action(() =>
+                        {
+                            MessageBox.Show(
+                                $"⚠️ WARNING: Disk space is running low!\n\n" +
+                                $"Free space: {freeSpaceGB:F2} GB\n" +
+                                $"Used: {usedPercent:F1}%\n\n" +
+                                "Recording will automatically stop if space drops below 1 GB.\n\n" +
+                                "Consider freeing up disk space soon.",
+                                "Low Disk Space Warning",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Warning);
+                        }));
+                        LogCameraInfo($"WARNING: Low disk space ({freeSpaceGB:F2} GB free)");
+                    }
+                }
+                else
+                {
+                    // Reset warning flag when not recording
+                    if (freeSpaceGB >= 5.0)
+                    {
+                        diskSpaceWarningShown = false;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogCameraInfo($"Error checking disk space: {ex.Message}");
+            }
         }
         private string GetVideoCodecTag(string videoFile)
         {
@@ -7905,50 +8943,6 @@ namespace MultiCamRecorder
             return ""; // Empty means auto-detect
         }
 
-        private double GetVideoFrameRateFromFile(string videoFile)
-        {
-            try
-            {
-                string ffprobePath = Path.Combine(Path.GetDirectoryName(FFMPEG_PATH)!, "ffprobe.exe");
-                
-                if (!File.Exists(ffprobePath))
-                    return 0;
-
-                ProcessStartInfo startInfo = new ProcessStartInfo
-                {
-                    FileName = ffprobePath,
-                    Arguments = $"-v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 \"{videoFile}\"",
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true
-                };
-
-                using (Process process = Process.Start(startInfo)!)
-                {
-                    string output = process.StandardOutput.ReadToEnd().Trim();
-                    process.WaitForExit();
-
-                    // Frame rate comes as fraction like "30/1" or "30000/1001"
-                    if (!string.IsNullOrEmpty(output) && output.Contains("/"))
-                    {
-                        string[] parts = output.Split('/');
-                        if (parts.Length == 2 && 
-                            double.TryParse(parts[0], out double num) && 
-                            double.TryParse(parts[1], out double den) && 
-                            den > 0)
-                        {
-                            return num / den;
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                LogCameraInfo($"Error detecting frame rate: {ex.Message}");
-            }
-
-            return 0;
-        }
 
         private void ToggleCameraExpansion(int cameraIndex)
         {
