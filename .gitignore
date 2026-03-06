@@ -30,7 +30,6 @@ bld/
 
 # Lab distribution folder
 [Ll]ab_Distribution/
-MultiCamRecorder_Lab_*.zip
 
 # Installers folder (may contain large installers)
 [Ii]nstallers/

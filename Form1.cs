@@ -86,7 +86,7 @@ namespace QueenPix
         // Class to hold information about each camera
         private class CameraControl
         {
-            public ICImagingControl ImagingControl { get; set; }
+            public ICImagingControl ImagingControl { get; set; } = null!;
             public Label NameLabel { get; set; }
             public Label FpsLabel { get; set; }
             public BaseSink? OriginalSink { get; set; }
@@ -147,9 +147,10 @@ namespace QueenPix
             public double[] FpsHistory { get; set; } = new double[3];
             public int FpsHistoryIndex { get; set; }
 
-            public CameraControl(string deviceName)
+            public CameraControl(string deviceName, bool isImagingSource = true)
             {
-                ImagingControl = new ICImagingControl();
+                if (isImagingSource)
+                    ImagingControl = new ICImagingControl();
                 NameLabel = new Label();
                 FpsLabel = new Label();
                 OriginalSink = null;
@@ -4123,7 +4124,7 @@ namespace QueenPix
                 var (wcName, wcIndex) = webcamDevices[wi];
                 int camIdx = webcamStartIndex + wi;
 
-                var camera = new CameraControl(wcName)
+                var camera = new CameraControl(wcName, isImagingSource: false)
                 {
                     IsImagingSource = false,
                     WebcamDeviceIndex = wcIndex,
@@ -5022,7 +5023,7 @@ namespace QueenPix
                 var (wcName, wcIndex) = webcamDevices2[wi];
                 int camIdx = webcamStartIndex2 + wi;
 
-                var camera = new CameraControl(wcName)
+                var camera = new CameraControl(wcName, isImagingSource: false)
                 {
                     IsImagingSource = false,
                     WebcamDeviceIndex = wcIndex,
@@ -6395,6 +6396,48 @@ namespace QueenPix
                 {
                     try
                     {
+                        if (!camera.IsImagingSource)
+                        {
+                            // Webcam screenshot — grab last captured frame
+                            System.Drawing.Bitmap? webcamBmp = null;
+                            lock (camera.WebcamFrameLock)
+                            {
+                                if (camera.WebcamLastFrame != null && !camera.WebcamLastFrame.Empty())
+                                    webcamBmp = OpenCvSharp.Extensions.BitmapConverter.ToBitmap(camera.WebcamLastFrame);
+                            }
+                            if (webcamBmp == null)
+                            {
+                                errors.Add($"Camera {cameras.IndexOf(camera) + 1}: No frame available");
+                                continue;
+                            }
+                            try
+                            {
+                                string cameraName = string.IsNullOrWhiteSpace(camera.CustomName)
+                                    ? $"Camera{cameras.IndexOf(camera) + 1}"
+                                    : camera.CustomName.Replace(" ", "_");
+                                string filename = $"{timestamp}_{cameraName}.png";
+                                string filepath = Path.Combine(screenshotsFolder, filename);
+                                if (showSaveDialog)
+                                {
+                                    using (SaveFileDialog saveDialog = new SaveFileDialog())
+                                    {
+                                        saveDialog.Filter = "PNG Image|*.png|All Files|*.*";
+                                        saveDialog.FileName = filename;
+                                        saveDialog.InitialDirectory = screenshotsFolder;
+                                        saveDialog.Title = $"Save Screenshot - {cameraName}";
+                                        if (saveDialog.ShowDialog(this) == DialogResult.OK)
+                                            filepath = saveDialog.FileName;
+                                        else
+                                            continue;
+                                    }
+                                }
+                                webcamBmp.Save(filepath, System.Drawing.Imaging.ImageFormat.Png);
+                                savedCount++;
+                            }
+                            finally { webcamBmp?.Dispose(); }
+                            continue;
+                        }
+
                         if (camera.ImagingControl.LiveVideoRunning)
                         {
                             ImageBuffer? imageBuffer = null;

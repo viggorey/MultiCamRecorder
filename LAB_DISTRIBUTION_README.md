@@ -21,7 +21,7 @@
 3. Restart your computer (recommended)
 
 ### Step 3: Run the Application
-1. After extracting the ZIP, navigate to `QueenPix\QueenPix\` folder
+1. After extracting the ZIP, navigate to the `QueenPix\` folder
 2. Run `QueenPix.exe`
 3. Click "Refresh Cameras" to detect connected cameras
 
@@ -29,20 +29,21 @@
 
 ```
 QueenPix/
-├── QueenPix/
-│   ├── QueenPix.exe            ← Main application
-│   ├── ffmpeg.exe              ← Video processing tool
-│   └── ffprobe.exe             ← Video analysis tool
-│
+├── QueenPix.exe                 ← Main application
+├── ffmpeg.exe                   ← Video processing tool
+├── ffprobe.exe                  ← Video analysis tool
 ├── Installers/
-│   ├── TIS_Imaging_SDK_Installer.exe  ← Install this for Y800 format support
-│   ├── DriverDMKCameras.exe           ← Standalone driver installer (if applicable)
-│   └── usbcam_3.0.4.2535_tis/         ← Driver folder (if installer requires data folder)
+│   ├── TIS_Imaging_SDK_Installer.exe  ← Install this for Y800 format support (optional - download if needed)
+│   └── usbcam_3.0.4.2535_tis/         ← Camera driver installer
 │       ├── drvInstaller.exe
 │       └── data/
-│
 └── README.md (this file)
 ```
+
+**Note:** The TIS.Imaging SDK installer may not be included in the package. If you need it:
+1. Download from: https://www.theimagingsource.com/support/downloads/
+2. Look for "IC Imaging Control 3.5" SDK installer
+3. Place it in the `Installers\` folder before creating the package
 
 ## Installation Order
 
@@ -51,7 +52,9 @@ QueenPix/
 1. **Camera Drivers** (from manufacturer)
    - If you see a driver folder (e.g., `usbcam_3.0.4.2535_tis/`), run the installer inside that folder (e.g., `drvInstaller.exe`)
    - If you see a standalone installer (e.g., `DriverDMKCameras.exe`), run it directly
-2. **TIS.Imaging SDK** (from this package)
+2. **TIS.Imaging SDK** (optional - only if `TIS_Imaging_SDK_Installer.exe` is present in the `Installers\` folder)
+   - Install this if you need Y800 format support
+   - If the installer is not in the package, download it from: https://www.theimagingsource.com/support/downloads/
 3. **Run QueenPix** (no installation needed)
 
 ## Troubleshooting

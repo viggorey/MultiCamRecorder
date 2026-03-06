@@ -1,7 +1,7 @@
 # Script to create lab distribution package
 # Usage: .\create-lab-package.ps1
 
-$packageName = "QueenPix_Lab_v1.0"
+$packageName = "QueenPix_Lab"
 $distFolder = "QueenPix"
 
 Write-Host "Creating lab distribution package..." -ForegroundColor Green
@@ -14,7 +14,6 @@ if (Test-Path $distFolder) {
 
 # Create folder structure
 Write-Host "Creating folder structure..." -ForegroundColor Cyan
-New-Item -ItemType Directory -Path "$distFolder\QueenPix" -Force | Out-Null
 New-Item -ItemType Directory -Path "$distFolder\Installers" -Force | Out-Null
 
 # Check if publish folder exists
@@ -34,17 +33,17 @@ if ($exeFiles.Count -eq 0) {
 }
 
 foreach ($file in $exeFiles) {
-    Copy-Item $file.FullName -Destination "$distFolder\QueenPix\"
+    Copy-Item $file.FullName -Destination "$distFolder\"
     Write-Host "  Copied $($file.Name)" -ForegroundColor Green
 }
 
 # Copy FFmpeg tools if they exist
 if (Test-Path "publish\ffmpeg.exe") {
-    Copy-Item "publish\ffmpeg.exe" -Destination "$distFolder\QueenPix\" -Force
+    Copy-Item "publish\ffmpeg.exe" -Destination "$distFolder\" -Force
     Write-Host "  Copied ffmpeg.exe" -ForegroundColor Green
 }
 if (Test-Path "publish\ffprobe.exe") {
-    Copy-Item "publish\ffprobe.exe" -Destination "$distFolder\QueenPix\" -Force
+    Copy-Item "publish\ffprobe.exe" -Destination "$distFolder\" -Force
     Write-Host "  Copied ffprobe.exe" -ForegroundColor Green
 }
 
