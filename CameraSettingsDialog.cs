@@ -7,15 +7,17 @@ namespace QueenPix
 {
     public class CameraSettingsDialog : Form
     {
-        private ICImagingControl imagingControl;
+        private ICImagingControl? imagingControl;
         private CameraSettings settings;
-        
+        private bool isImagingSource;
+        private int webcamDeviceIndex;
+
         private ComboBox cmbFormat;
-        private Button btnShowProperties;
-        private NumericUpDown numSoftwareFps;  // <-- NEW LINE
-        private Label lblFpsRange; 
-        private RadioButton rbExternalTrigger;
-        private RadioButton rbSoftwareControlled;
+        private Button? btnShowProperties;
+        private NumericUpDown? numSoftwareFps;
+        private Label? lblFpsRange;
+        private RadioButton? rbExternalTrigger;
+        private RadioButton? rbSoftwareControlled;
         private CheckBox chkShowDate;
         private CheckBox chkShowTime;
         private CheckBox chkShowMilliseconds;
@@ -25,21 +27,33 @@ namespace QueenPix
         public CameraSettings Settings { get; private set; }
         public bool SaveAsDefault { get; private set; }
         public bool ApplyToAllCameras { get; private set; }
-        
-        public CameraSettingsDialog(ICImagingControl control, CameraSettings currentSettings, int cameraNum, string currentRecordingMode = "")
+
+        public CameraSettingsDialog(
+            ICImagingControl? control,
+            CameraSettings currentSettings,
+            int cameraNum,
+            string currentRecordingMode = "",
+            bool isImagingSource = true,
+            int webcamDeviceIndex = -1)
         {
             imagingControl = control;
             settings = currentSettings.Clone();
             Settings = settings;
             cameraNumber = cameraNum;
             recordingMode = currentRecordingMode;
-            
+            this.isImagingSource = isImagingSource;
+            this.webcamDeviceIndex = webcamDeviceIndex;
+
             InitializeDialog();
         }
         
         private void InitializeDialog()
         {
-            this.Text = $"Camera {cameraNumber}: {imagingControl.Device} Settings";
+            if (isImagingSource && imagingControl != null)
+                this.Text = $"Camera {cameraNumber}: {imagingControl.Device} Settings";
+            else
+                this.Text = $"Camera {cameraNumber} Settings (Webcam)";
+
             this.Size = new System.Drawing.Size(550, 620);
             this.StartPosition = FormStartPosition.CenterParent;
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -259,51 +273,73 @@ namespace QueenPix
             y += 35;
             
             // Populate format dropdown
-            if (imagingControl.VideoFormats != null)
+            if (isImagingSource && imagingControl?.VideoFormats != null)
             {
                 foreach (var format in imagingControl.VideoFormats)
-                {
                     cmbFormat.Items.Add(format.ToString());
-                }
-                
-                // Select current format
+
                 string currentFormat = imagingControl.VideoFormatCurrent?.ToString() ?? "";
                 int idx = cmbFormat.Items.IndexOf(currentFormat);
                 if (idx >= 0)
                     cmbFormat.SelectedIndex = idx;
             }
-            
+            else if (!isImagingSource)
+            {
+                // Webcam: populate with supported resolutions from DirectShow
+                var resolutions = DirectShowHelper.GetSupportedResolutions(webcamDeviceIndex);
+                foreach (var (w, h) in resolutions)
+                    cmbFormat.Items.Add($"{w}x{h}");
+
+                // Select saved format (or default to 640x480)
+                string saved = settings.Format;
+                if (string.IsNullOrEmpty(saved)) saved = "640x480";
+                int idx = cmbFormat.Items.IndexOf(saved);
+                if (idx >= 0)
+                    cmbFormat.SelectedIndex = idx;
+                else if (cmbFormat.Items.Count > 0)
+                    cmbFormat.SelectedIndex = 0;
+
+                // Hide TIS-only controls for webcams
+                rbExternalTrigger!.Visible = false;
+                rbSoftwareControlled!.Visible = false;
+                numSoftwareFps!.Visible = false;
+                lblFpsRange!.Visible = false;
+            }
+
             y += 15;
-            
-            // Camera Properties button (uses SDK's built-in dialog)
-            Label lblProperties = new Label
+
+            if (isImagingSource)
             {
-                Text = "Camera Properties:",
-                Location = new System.Drawing.Point(leftMargin, y + 5),
-                Size = new System.Drawing.Size(labelWidth, 20)
-            };
-            this.Controls.Add(lblProperties);
-            
-            btnShowProperties = new Button
-            {
-                Text = "Adjust Exposure, Gain, etc...",
-                Location = new System.Drawing.Point(leftMargin + labelWidth, y),
-                Size = new System.Drawing.Size(controlWidth, 30)
-            };
-            btnShowProperties.Click += BtnShowProperties_Click;
-            this.Controls.Add(btnShowProperties);
-            y += 50;
-            
-            Label lblNote = new Label
-            {
-                Text = "Note: Property changes (exposure, gain, etc.) are saved automatically by the camera.",
-                Location = new System.Drawing.Point(leftMargin, y),
-                Size = new System.Drawing.Size(460, 30),
-                ForeColor = System.Drawing.Color.Gray,
-                Font = new System.Drawing.Font("Arial", 8)
-            };
-            this.Controls.Add(lblNote);
-            y += 50;
+                // Camera Properties button (uses SDK's built-in dialog)
+                Label lblProperties = new Label
+                {
+                    Text = "Camera Properties:",
+                    Location = new System.Drawing.Point(leftMargin, y + 5),
+                    Size = new System.Drawing.Size(labelWidth, 20)
+                };
+                this.Controls.Add(lblProperties);
+
+                btnShowProperties = new Button
+                {
+                    Text = "Adjust Exposure, Gain, etc...",
+                    Location = new System.Drawing.Point(leftMargin + labelWidth, y),
+                    Size = new System.Drawing.Size(controlWidth, 30)
+                };
+                btnShowProperties.Click += BtnShowProperties_Click;
+                this.Controls.Add(btnShowProperties);
+                y += 50;
+
+                Label lblNote = new Label
+                {
+                    Text = "Note: Property changes (exposure, gain, etc.) are saved automatically by the camera.",
+                    Location = new System.Drawing.Point(leftMargin, y),
+                    Size = new System.Drawing.Size(460, 30),
+                    ForeColor = System.Drawing.Color.Gray,
+                    Font = new System.Drawing.Font("Arial", 8)
+                };
+                this.Controls.Add(lblNote);
+                y += 50;
+            }
             
             // Buttons (aligned to the right)
             int buttonSpacing = 10;
@@ -348,10 +384,12 @@ namespace QueenPix
         
         private void PopulateFpsRangeInfo()
         {
+            if (lblFpsRange == null) return;
             try
             {
-                if (imagingControl.DeviceFrameRateAvailable && 
-                    imagingControl.DeviceFrameRates != null && 
+                if (imagingControl != null &&
+                    imagingControl.DeviceFrameRateAvailable &&
+                    imagingControl.DeviceFrameRates != null &&
                     imagingControl.DeviceFrameRates.Length > 0)
                 {
                     float[] rates = imagingControl.DeviceFrameRates;
@@ -375,16 +413,16 @@ namespace QueenPix
 
         private void RbFrameRateControl_CheckedChanged(object? sender, EventArgs e)
         {
-            // Enable/disable software FPS control based on selection
-            numSoftwareFps.Enabled = rbSoftwareControlled.Checked;
-            lblFpsRange.Enabled = rbSoftwareControlled.Checked;
+            if (numSoftwareFps != null) numSoftwareFps.Enabled = rbSoftwareControlled?.Checked ?? false;
+            if (lblFpsRange != null) lblFpsRange.Enabled = rbSoftwareControlled?.Checked ?? false;
         }
         private float ValidateAndAdjustFrameRate(float requestedFps)
         {
             try
             {
-                if (imagingControl.DeviceFrameRateAvailable && 
-                    imagingControl.DeviceFrameRates != null && 
+                if (imagingControl != null &&
+                    imagingControl.DeviceFrameRateAvailable &&
+                    imagingControl.DeviceFrameRates != null &&
                     imagingControl.DeviceFrameRates.Length > 0)
                 {
                     float[] rates = imagingControl.DeviceFrameRates;
@@ -456,15 +494,31 @@ namespace QueenPix
 
         private void BtnShowProperties_Click(object? sender, EventArgs e)
         {
+            if (imagingControl == null) return;
             try
             {
-                // Show the built-in property dialog from IC Imaging Control SDK
-                // This handles all camera properties (exposure, gain, white balance, gamma, etc.)
+                if (!imagingControl.DeviceValid)
+                {
+                    MessageBox.Show("Camera is not properly connected.\n\n" +
+                                  "The property dialog requires the camera to be initialized.\n" +
+                                  "This may be due to:\n" +
+                                  "1. TIS.Imaging SDK not installed\n" +
+                                  "2. DirectShow filters not registered\n" +
+                                  "3. Camera driver issues\n\n" +
+                                  "Please install the TIS.Imaging SDK and restart the application.",
+                                  "Camera Not Ready", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
                 imagingControl.ShowPropertyDialog();
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Error showing property dialog: {ex.Message}",
+                MessageBox.Show($"Error showing property dialog: {ex.Message}\n\n" +
+                              "This may indicate that:\n" +
+                              "1. TIS.Imaging SDK is not properly installed\n" +
+                              "2. DirectShow filters are not registered\n" +
+                              "3. Camera is not fully initialized\n\n" +
+                              "Please install the TIS.Imaging SDK installer and restart the application.",
                                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
@@ -472,25 +526,34 @@ namespace QueenPix
         
         private void SaveSettings()
         {
-            SaveAsDefault = true;  // Always save as default now
-            
+            SaveAsDefault = true;
+
             // Save format setting
             if (cmbFormat.SelectedItem != null)
-            {
                 settings.Format = cmbFormat.SelectedItem.ToString() ?? "";
-            }
-            
-            // Save frame rate control mode
-            settings.UseExternalTrigger = rbExternalTrigger.Checked;
-            
-            // Validate and save frame rate (only if software controlled)
-            if (rbSoftwareControlled.Checked)
+
+            if (isImagingSource)
             {
-                float requestedFps = (float)numSoftwareFps.Value;
-                float finalFps = ValidateAndAdjustFrameRate(requestedFps);
-                settings.SoftwareFrameRate = finalFps;
+                // Save frame rate control mode
+                settings.UseExternalTrigger = rbExternalTrigger?.Checked ?? false;
+
+                // Validate and save frame rate (only if software controlled)
+                if (rbSoftwareControlled?.Checked == true && numSoftwareFps != null)
+                {
+                    float requestedFps = (float)numSoftwareFps.Value;
+                    float finalFps = ValidateAndAdjustFrameRate(requestedFps);
+                    settings.SoftwareFrameRate = finalFps;
+                }
+
+                // Save VCD properties as XML string
+                try
+                {
+                    if (imagingControl?.VCDPropertyItems != null)
+                        settings.VCDPropertiesXml = imagingControl.VCDPropertyItems.Save();
+                }
+                catch { }
             }
-            
+
             // Save date/time overlay settings (only if not Normal Recording mode)
             bool isNormalRecording = recordingMode.Equals("Normal Recording", StringComparison.OrdinalIgnoreCase);
             if (!isNormalRecording)
@@ -501,25 +564,15 @@ namespace QueenPix
             }
             else
             {
-                // Force disable overlay in Normal Recording mode
                 settings.ShowDate = false;
                 settings.ShowTime = false;
                 settings.ShowMilliseconds = false;
             }
-            
+
             // Save JSON timestamp file generation setting
             settings.GenerateJsonTimestamps = chkGenerateJsonTimestamps.Checked;
-            
-            // Save VCD properties as XML string
-            try
-            {
-                if (imagingControl.VCDPropertyItems != null)
-                {
-                    settings.VCDPropertiesXml = imagingControl.VCDPropertyItems.Save();
-                }
-            }
-            catch { }
-            
+
+            settings.IsImagingSource = isImagingSource;
             Settings = settings;
         }
 

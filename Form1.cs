@@ -40,6 +40,12 @@ namespace QueenPix
         public Dictionary<string, CameraSettings> CameraSettingsByDevice { get; set; } = new Dictionary<string, CameraSettings>();
         public List<CameraNameProfile> NameProfiles { get; set; } = new List<CameraNameProfile>();
         public string LastUsedProfile { get; set; } = "";
+
+        // Camera group assignments: DeviceName → GroupId ("A","B","C","D") or "" = unassigned
+        public Dictionary<string, string> CameraGroupAssignments { get; set; } = new();
+        public Dictionary<string, string> GroupNames { get; set; } = new()
+            { ["A"] = "Group A", ["B"] = "Group B", ["C"] = "Group C", ["D"] = "Group D" };
+        public List<string> ActiveGroupIds { get; set; } = new() { "A", "B" };
         public static UserSettings Load()
         {
             try
@@ -60,8 +66,10 @@ namespace QueenPix
             try
             {
                 string path = GetSettingsPath();
+                string tmp = path + ".tmp";
                 string json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(path, json);
+                File.WriteAllText(tmp, json);
+                File.Move(tmp, path, overwrite: true);
             }
             catch { }
         }
@@ -83,6 +91,7 @@ namespace QueenPix
             public Label FpsLabel { get; set; }
             public BaseSink? OriginalSink { get; set; }
             public Button SettingsButton { get; set; }
+            public Button TriggerButton { get; set; }
             public CameraSettings Settings { get; set; }
             public int FrameCount { get; set; }
             public DateTime LastFpsUpdate { get; set; }
@@ -90,7 +99,7 @@ namespace QueenPix
             public string? RecordingFilePath { get; set; }
             public int TotalRecordedFrames { get; set; }
             public DateTime? RecordingStartTime { get; set; }
-            public DateTime? RecordingStopTime { get; set; } 
+            public DateTime? RecordingStopTime { get; set; }
             public TextBox NameTextBox { get; set; }
             public string CustomName { get; set; }
             public Queue<System.Drawing.Bitmap>? LoopBuffer { get; set; }
@@ -107,7 +116,37 @@ namespace QueenPix
             public int TimelapseFrameCount { get; set; }
             public List<string>? TimelapseImagePaths { get; set; }
             public double TimelapseIntervalSeconds { get; set; }
-            
+
+            // Group assignment
+            public string GroupId { get; set; } = "";
+            public Label? GroupIndicatorLabel { get; set; }
+
+            // Camera type flag
+            public bool IsImagingSource { get; set; } = true;
+
+            // Webcam-specific fields
+            public int WebcamDeviceIndex { get; set; }
+            public VideoCapture? WebcamCapture { get; set; }
+            public System.Windows.Forms.PictureBox? WebcamPreview { get; set; }
+            public Thread? WebcamThread { get; set; }
+            public CancellationTokenSource? WebcamCts { get; set; }
+            public VideoWriter? WebcamWriter { get; set; }
+            public Mat? WebcamLastFrame { get; set; }
+            public object WebcamFrameLock { get; set; } = new object();
+            public long WebcamFrameCount { get; set; }
+            public (int Width, int Height) WebcamResolution { get; set; } = (640, 480);
+
+            // Preview throttle (Fix 1)
+            public DateTime WebcamLastPreviewTime { get; set; } = DateTime.MinValue;
+
+            // File size cache (Fix 2)
+            public long CachedFileSizeMB { get; set; }
+            public DateTime FileSizeLastChecked { get; set; } = DateTime.MinValue;
+
+            // FPS smoothing (Fix 5)
+            public double[] FpsHistory { get; set; } = new double[3];
+            public int FpsHistoryIndex { get; set; }
+
             public CameraControl(string deviceName)
             {
                 ImagingControl = new ICImagingControl();
@@ -120,11 +159,12 @@ namespace QueenPix
                 RecordingFilePath = null;
                 TotalRecordedFrames = 0;
                 RecordingStartTime = null;
-                RecordingStopTime = null; 
+                RecordingStopTime = null;
                 SettingsButton = new Button();
+                TriggerButton = new Button();
                 Settings = new CameraSettings();
                 NameTextBox = new TextBox();
-                CustomName = "";    
+                CustomName = "";
                 LoopBuffer = null;
                 MaxLoopFrames = 0;
                 LoopBufferLock = new object();
@@ -182,7 +222,7 @@ namespace QueenPix
         private NumericUpDown numTimelapseHours = null!;
         private NumericUpDown numTimelapseMinutes = null!;
         private NumericUpDown numTimelapseSeconds = null!;
-        private System.Windows.Forms.Timer? timelapseTimer = null;
+        private Dictionary<string, System.Windows.Forms.Timer> _timelapsTimers = new(); // groupId → timer
         private CheckBox chkLoopRecording = null!;
         
         // Working folder controls
@@ -200,9 +240,31 @@ namespace QueenPix
         
         // Recording state
         private bool isRecording = false;
+        private bool isTimelapseMode = false; // class-level flag for webcam capture loop
         private string currentRecordingBaseName = ""; // Store the timestamp-based name
         private bool wasLiveBeforeSettings = false;
         private bool isBenchmarkMode = false;
+
+        // Group recording state
+        private Dictionary<string, bool> _groupRecording = new();
+        private Dictionary<string, string> _groupRecordingBaseName = new();
+        private Dictionary<string, string> _groupRecordingMode = new(); // "A" → "Normal Recording" / "Timelapse"
+        private Dictionary<string, List<CameraControl>> _groupCameras = new(); // "A" → exact cameras recorded
+        private List<CameraControl>? _recordingFilter = null; // null = all cameras
+
+        // Group UI
+        private Panel _groupButtonPanel = null!;
+        private Dictionary<string, (Button Rec, Button Stop, Label Status)> _groupButtonMap = new();
+        private Button btnManageGroups = null!;
+
+        // Group color map
+        private static readonly Dictionary<string, System.Drawing.Color> GroupColors = new()
+        {
+            ["A"] = System.Drawing.Color.RoyalBlue,
+            ["B"] = System.Drawing.Color.ForestGreen,
+            ["C"] = System.Drawing.Color.DarkOrange,
+            ["D"] = System.Drawing.Color.MediumPurple,
+        };
 
 
         private bool IsOneDrivePath(string path)
@@ -243,7 +305,7 @@ namespace QueenPix
         private const int CAMERA_WIDTH = 320;
         private const int CAMERA_HEIGHT = 240;
         private const int CAMERA_SPACING = 10;
-        private const int TOP_MARGIN = 145; // Increased for menu + buttons + working folder
+        private const int TOP_MARGIN = 185; // Increased for menu + buttons + working folder + group buttons
         private const int SIDE_MARGIN = 10;
         private readonly float dpiScale;
         
@@ -263,6 +325,7 @@ namespace QueenPix
         private long lastTotalBytesWritten = 0;
         private bool diskSpaceWarningShown = false;
         private Label lblDiskSpace = null!;
+        private Label lblLoopWebcamWarning = null!;
 
         public Form1()
         {
@@ -734,7 +797,16 @@ namespace QueenPix
             };
             btnScreenshot.Click += BtnScreenshot_Click;
             this.Controls.Add(btnScreenshot);
-            
+
+            btnManageGroups = new Button
+            {
+                Text = "👥 Groups",
+                Location = ScalePoint(buttonX + buttonSpacing * 7, buttonY),
+                Size = ScaleSize(buttonWidth, 30)
+            };
+            btnManageGroups.Click += (s, e) => ShowGroupsDialog();
+            this.Controls.Add(btnManageGroups);
+
             // Working folder controls
             int folderY = buttonY + 40;
             
@@ -1075,6 +1147,15 @@ namespace QueenPix
             numExternalTriggerFps.Tag = "externalTriggerFps";
             numLoopDuration.Tag = "loopDuration";
             this.cmbRecordingMode = cmbRecordingMode;
+
+            // Group button panel (Row 4, y=145 in design space, hidden by default)
+            _groupButtonPanel = new Panel
+            {
+                Location = ScalePoint(SIDE_MARGIN, 145),
+                Size = new System.Drawing.Size(this.Width - SIDE_MARGIN * 2, ScaleValue(38)),
+                Visible = false
+            };
+            this.Controls.Add(_groupButtonPanel);
         }
         private System.Drawing.Bitmap DeepCloneBitmap(System.Drawing.Bitmap source)
         {
@@ -3805,39 +3886,50 @@ namespace QueenPix
             // Clear existing cameras
             foreach (var cam in cameras)
             {
-                try
+                if (!cam.IsImagingSource)
                 {
-                    if (cam.ImagingControl.LiveVideoRunning)
-                    {
-                        cam.ImagingControl.LiveStop();
-                    }
+                    // Webcam cleanup
+                    try { cam.WebcamCts?.Cancel(); } catch { }
+                    try { cam.WebcamThread?.Join(1000); } catch { }
+                    try { cam.WebcamCapture?.Dispose(); } catch { }
+                    try { cam.WebcamLastFrame?.Dispose(); } catch { }
+                    try { cam.WebcamWriter?.Dispose(); } catch { }
+                    if (cam.WebcamPreview != null)
+                        this.Controls.Remove(cam.WebcamPreview);
                 }
-                catch { }
-                
-                this.Controls.Remove(cam.ImagingControl);
+                else
+                {
+                    try
+                    {
+                        if (cam.ImagingControl.LiveVideoRunning)
+                            cam.ImagingControl.LiveStop();
+                    }
+                    catch { }
+                    cam.ImagingControl.Dispose();
+                    this.Controls.Remove(cam.ImagingControl);
+                }
                 this.Controls.Remove(cam.NameLabel);
                 this.Controls.Remove(cam.FpsLabel);
                 this.Controls.Remove(cam.NameTextBox);
                 this.Controls.Remove(cam.SettingsButton);
-                cam.ImagingControl.Dispose();
+                this.Controls.Remove(cam.TriggerButton);
+                if (cam.GroupIndicatorLabel != null)
+                {
+                    this.Controls.Remove(cam.GroupIndicatorLabel);
+                    cam.GroupIndicatorLabel = null;
+                }
             }
             cameras.Clear();
 
-            // Create a temporary ICImagingControl to get available devices
+            // Create a temporary ICImagingControl to get available TIS devices
             string[] deviceNames;
-            using (var tempControl = new ICImagingControl())
+            try
             {
+                using var tempControl = new ICImagingControl();
                 var devices = tempControl.Devices;
-                
-                if (devices == null || devices.Length == 0)
-                {
-                    MessageBox.Show("No cameras detected! Please connect cameras and click 'Refresh Cameras'.",
-                                    "No Cameras", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
-                }
-
-                deviceNames = devices.Select(d => d.Name).ToArray();
+                deviceNames = devices?.Select(d => d.Name).ToArray() ?? Array.Empty<string>();
             }
+            catch { deviceNames = Array.Empty<string>(); }
 
             System.Threading.Thread.Sleep(200);
 
@@ -3889,11 +3981,26 @@ namespace QueenPix
                 this.Controls.Add(camera.SettingsButton);
                 camera.SettingsButton.BringToFront();
 
+                // Trigger button - positioned to the left of Settings button
+                camera.TriggerButton = new Button
+                {
+                    Text = "🔘 Trigger",
+                    Location = new System.Drawing.Point(xPosition + CAMERA_WIDTH - 160, yPosition + 42),
+                    Size = new System.Drawing.Size(75, 22),
+                    Font = new System.Drawing.Font("Arial", 7)
+                };
+                int triggerCameraIndex = i; // Capture index for event handler
+                camera.TriggerButton.Click += (s, e) => ToggleCameraTrigger(triggerCameraIndex);
+                this.Controls.Add(camera.TriggerButton);
+                camera.TriggerButton.BringToFront();
+
                 // Load saved settings for this camera if available
                 if (settings.CameraSettingsByDevice.ContainsKey(deviceName))
                 {
                     camera.Settings = settings.CameraSettingsByDevice[deviceName];
                 }
+                if (settings.CameraGroupAssignments.TryGetValue(deviceName, out string? gid))
+                    camera.GroupId = gid ?? "";
 
                 camera.FpsLabel.Text = "Ready";
                 camera.FpsLabel.Location = new System.Drawing.Point(xPosition, yPosition + 45);
@@ -4004,17 +4111,137 @@ namespace QueenPix
                 cameras.Add(camera);
             }
 
+            // ---- Webcam enumeration ----
+            // Get all DirectShow video devices and filter out any that are TIS cameras
+            var tisNames = new HashSet<string>(deviceNames, StringComparer.OrdinalIgnoreCase);
+            var allDirectShowDevices = DirectShowHelper.EnumerateVideoDevices();
+            var webcamDevices = allDirectShowDevices.Where(d => !tisNames.Contains(d.Name)).ToList();
 
+            int webcamStartIndex = cameras.Count; // position offset for layout
+            for (int wi = 0; wi < webcamDevices.Count; wi++)
+            {
+                var (wcName, wcIndex) = webcamDevices[wi];
+                int camIdx = webcamStartIndex + wi;
+
+                var camera = new CameraControl(wcName)
+                {
+                    IsImagingSource = false,
+                    WebcamDeviceIndex = wcIndex,
+                };
+                camera.Settings.IsImagingSource = false;
+
+                int xPosition = SIDE_MARGIN + (camIdx * (CAMERA_WIDTH + CAMERA_SPACING));
+                int yPosition = TOP_MARGIN;
+
+                // Editable camera name textbox
+                camera.NameTextBox = new TextBox
+                {
+                    Text = $"Camera{camIdx + 1}",
+                    Location = new System.Drawing.Point(xPosition, yPosition),
+                    Size = new System.Drawing.Size(CAMERA_WIDTH - 10, 20),
+                    Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold),
+                    BorderStyle = BorderStyle.FixedSingle
+                };
+                camera.CustomName = $"Camera{camIdx + 1}";
+                int capturedWcIdx = camIdx;
+                camera.NameTextBox.TextChanged += (s, e) =>
+                {
+                    if (capturedWcIdx < cameras.Count)
+                        cameras[capturedWcIdx].CustomName = camera.NameTextBox.Text;
+                };
+                this.Controls.Add(camera.NameTextBox);
+
+                // Device name label
+                camera.NameLabel.Text = wcName + " (Webcam)";
+                camera.NameLabel.Location = new System.Drawing.Point(xPosition, yPosition + 22);
+                camera.NameLabel.AutoSize = false;
+                camera.NameLabel.Size = new System.Drawing.Size(CAMERA_WIDTH, 18);
+                camera.NameLabel.Font = new System.Drawing.Font("Arial", 7);
+                camera.NameLabel.ForeColor = System.Drawing.Color.DarkBlue;
+                this.Controls.Add(camera.NameLabel);
+
+                // Settings button only (NO trigger button for webcams)
+                camera.SettingsButton = new Button
+                {
+                    Text = "⚙️ Settings",
+                    Location = new System.Drawing.Point(xPosition + CAMERA_WIDTH - 80, yPosition + 42),
+                    Size = new System.Drawing.Size(75, 22),
+                    Font = new System.Drawing.Font("Arial", 7)
+                };
+                int settingsCamIdx = camIdx;
+                camera.SettingsButton.Click += (s, e) => ShowCameraSettings(settingsCamIdx);
+                this.Controls.Add(camera.SettingsButton);
+                camera.SettingsButton.BringToFront();
+
+                // FPS label
+                camera.FpsLabel.Text = "Ready";
+                camera.FpsLabel.Location = new System.Drawing.Point(xPosition, yPosition + 45);
+                camera.FpsLabel.Size = new System.Drawing.Size(CAMERA_WIDTH - 90, 20);
+                camera.FpsLabel.ForeColor = System.Drawing.Color.DarkBlue;
+                camera.FpsLabel.Font = new System.Drawing.Font("Arial", 8, System.Drawing.FontStyle.Bold);
+                this.Controls.Add(camera.FpsLabel);
+
+                // PictureBox for webcam preview
+                camera.WebcamPreview = new System.Windows.Forms.PictureBox
+                {
+                    Location = new System.Drawing.Point(xPosition, yPosition + 68),
+                    Size = new System.Drawing.Size(CAMERA_WIDTH, CAMERA_HEIGHT),
+                    SizeMode = System.Windows.Forms.PictureBoxSizeMode.StretchImage,
+                    BackColor = System.Drawing.Color.Black
+                };
+                int previewCamIdx = camIdx;
+                camera.WebcamPreview.MouseClick += (s, e) => ToggleCameraExpansion(previewCamIdx);
+                this.Controls.Add(camera.WebcamPreview);
+
+                // Load saved settings
+                if (settings.CameraSettingsByDevice.ContainsKey(wcName))
+                {
+                    camera.Settings = settings.CameraSettingsByDevice[wcName];
+                    camera.Settings.IsImagingSource = false;
+                    if (!string.IsNullOrEmpty(camera.Settings.Format) &&
+                        camera.Settings.Format.Contains("x"))
+                    {
+                        var parts = camera.Settings.Format.Split('x');
+                        if (parts.Length == 2 &&
+                            int.TryParse(parts[0], out int sw) &&
+                            int.TryParse(parts[1], out int sh))
+                        {
+                            camera.WebcamResolution = (sw, sh);
+                        }
+                    }
+                }
+                else
+                {
+                    camera.Settings.Format = "640x480";
+                    camera.WebcamResolution = (640, 480);
+                }
+                if (settings.CameraGroupAssignments.TryGetValue(wcName, out string? wcGid))
+                    camera.GroupId = wcGid ?? "";
+
+                cameras.Add(camera);
+            }
+
+            // Show "no cameras" message only if both TIS and webcam lists are empty
+            if (cameras.Count == 0)
+            {
+                MessageBox.Show("No cameras detected! Please connect cameras and click 'Refresh Cameras'.",
+                                "No Cameras", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // Update loop recording availability based on webcam presence
+            UpdateLoopAvailability();
+            UpdateGroupButtonRow();
 
             if (cameras.Count > 0)
             {
                 btnStartLive.Enabled = true;
                 if (!suppressMessage)
                 {
-                    MessageBox.Show($"Detected {cameras.Count} camera(s)!", 
+                    MessageBox.Show($"Detected {cameras.Count} camera(s)!",
                                     "Cameras Found", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
-                
+
                 // Update RAM estimate with new camera info
                 UpdateRamEstimate();
             }
@@ -4022,11 +4249,9 @@ namespace QueenPix
             int requiredWidth = SIDE_MARGIN * 2 + (cameras.Count * (CAMERA_WIDTH + CAMERA_SPACING));
             if (requiredWidth > this.Width)
             {
-                // Allow window to be wider than screen for horizontal scrolling
-                // Cap at reasonable maximum (5000px) to prevent excessive width
                 this.Width = Math.Min(requiredWidth, 5000);
             }
-            UpdateRamEstimate(); 
+            UpdateRamEstimate();
 
             if (cmbPreviewSize != null && cmbLayoutMode != null)
             {
@@ -4034,35 +4259,351 @@ namespace QueenPix
             }
         }
 
+        /// <summary>
+        /// Disables Loop Recording mode when any webcam is connected (webcams don't support it).
+        /// </summary>
+        private void UpdateLoopAvailability()
+        {
+            bool hasWebcam = cameras.Any(c => !c.IsImagingSource);
+            bool hasGroupAssignments = cameras.Any(c => !string.IsNullOrEmpty(c.GroupId));
+            bool disableLoop = hasWebcam || hasGroupAssignments;
+
+            // Remove or re-add "Loop Recording" from the dropdown
+            int loopIdx = cmbRecordingMode.Items.IndexOf("Loop Recording");
+
+            if (disableLoop && loopIdx >= 0)
+            {
+                // If currently selected, switch to Normal Recording first
+                if (cmbRecordingMode.SelectedItem?.ToString() == "Loop Recording")
+                    cmbRecordingMode.SelectedIndex = 0;
+                cmbRecordingMode.Items.RemoveAt(loopIdx);
+            }
+            else if (!disableLoop && loopIdx < 0)
+            {
+                // Re-add Loop Recording when no webcams and no group assignments
+                cmbRecordingMode.Items.Add("Loop Recording");
+            }
+
+            // Show/hide warning label (created lazily)
+            if (lblLoopWebcamWarning == null)
+            {
+                // Find the combobox location to position the warning nearby
+                lblLoopWebcamWarning = new Label
+                {
+                    Text = "⚠️ Loop Recording unavailable — webcam(s) connected",
+                    AutoSize = false,
+                    Size = new System.Drawing.Size(350, 18),
+                    ForeColor = System.Drawing.Color.OrangeRed,
+                    Font = new System.Drawing.Font("Arial", 7),
+                    Visible = false
+                };
+                // Position below the recording mode combo
+                lblLoopWebcamWarning.Location = new System.Drawing.Point(
+                    cmbRecordingMode.Left,
+                    cmbRecordingMode.Bottom + 2);
+                this.Controls.Add(lblLoopWebcamWarning);
+            }
+            if (hasWebcam)
+                lblLoopWebcamWarning.Text = "⚠️ Loop Recording unavailable — webcam(s) connected";
+            else if (hasGroupAssignments)
+                lblLoopWebcamWarning.Text = "⚠️ Loop Recording unavailable — group assignments active";
+            lblLoopWebcamWarning.Visible = disableLoop;
+        }
+
+        private void UpdateGroupButtonRow()
+        {
+            if (_groupButtonPanel == null) return;
+            _groupButtonPanel.Controls.Clear();
+            _groupButtonMap.Clear();
+
+            int x = 0;
+            int btnH = ScaleValue(30);
+            foreach (string groupId in settings.ActiveGroupIds)
+            {
+                var groupCameras = cameras.Where(c => c.GroupId == groupId).ToList();
+                if (groupCameras.Count == 0) continue;
+
+                string gName = settings.GroupNames.GetValueOrDefault(groupId, $"Group {groupId}");
+                bool isGroupRec = _groupRecording.GetValueOrDefault(groupId);
+
+                // Colored swatch
+                var swatch = new Label
+                {
+                    Size = new System.Drawing.Size(ScaleValue(14), ScaleValue(14)),
+                    BackColor = GroupColors.GetValueOrDefault(groupId, System.Drawing.Color.Gray),
+                    BorderStyle = BorderStyle.FixedSingle,
+                    Location = new System.Drawing.Point(x, (btnH - ScaleValue(14)) / 2)
+                };
+                _groupButtonPanel.Controls.Add(swatch);
+                x += ScaleValue(18);
+
+                // Group name label
+                var nameLabel = new Label
+                {
+                    Text = gName,
+                    AutoSize = false,
+                    Size = new System.Drawing.Size(ScaleValue(90), btnH),
+                    Location = new System.Drawing.Point(x, 0),
+                    TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
+                    Font = new System.Drawing.Font("Arial", 8, System.Drawing.FontStyle.Bold)
+                };
+                _groupButtonPanel.Controls.Add(nameLabel);
+                x += ScaleValue(94);
+
+                // Rec button
+                var recBtn = new Button
+                {
+                    Text = "▶ Rec",
+                    Size = new System.Drawing.Size(ScaleValue(65), btnH),
+                    Location = new System.Drawing.Point(x, 0),
+                    Enabled = !isGroupRec && !string.IsNullOrEmpty(txtWorkingFolder.Text) && cameras.Count > 0,
+                    ForeColor = System.Drawing.Color.DarkGreen
+                };
+                string capturedGroupId = groupId;
+                recBtn.Click += (s2, e2) =>
+                {
+                    _recordingFilter = cameras.Where(c => c.GroupId == capturedGroupId).ToList();
+                    BtnStartRecording_Click(null, EventArgs.Empty);
+                };
+                _groupButtonPanel.Controls.Add(recBtn);
+                x += ScaleValue(69);
+
+                // Stop button
+                var stopBtn = new Button
+                {
+                    Text = "■ Stop",
+                    Size = new System.Drawing.Size(ScaleValue(65), btnH),
+                    Location = new System.Drawing.Point(x, 0),
+                    Enabled = isGroupRec,
+                    ForeColor = System.Drawing.Color.DarkRed
+                };
+                stopBtn.Click += (s2, e2) =>
+                {
+                    btnScreenshot.Enabled = btnStopLive.Enabled;
+                    StopRecording(capturedGroupId);
+                };
+                _groupButtonPanel.Controls.Add(stopBtn);
+                x += ScaleValue(69);
+
+                // Status label
+                var statusLabel = new Label
+                {
+                    Text = isGroupRec ? "🔴 REC" : "Ready",
+                    AutoSize = false,
+                    Size = new System.Drawing.Size(ScaleValue(80), btnH),
+                    Location = new System.Drawing.Point(x, 0),
+                    TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
+                    ForeColor = isGroupRec ? System.Drawing.Color.Red : System.Drawing.Color.Gray,
+                    Font = new System.Drawing.Font("Arial", 8)
+                };
+                _groupButtonPanel.Controls.Add(statusLabel);
+                x += ScaleValue(88);
+
+                _groupButtonMap[groupId] = (recBtn, stopBtn, statusLabel);
+            }
+
+            bool hasAnyGroupedCamera = cameras.Any(c => !string.IsNullOrEmpty(c.GroupId));
+            _groupButtonPanel.Visible = hasAnyGroupedCamera;
+
+            // Global Start Recording: only for unassigned cameras; independent of group sessions
+            bool hasUnassigned = cameras.Any(c => string.IsNullOrEmpty(c.GroupId));
+            bool globalSessionActive = _groupRecording.GetValueOrDefault(""); // "" key = unassigned cameras
+            btnStartRecording.Enabled = hasUnassigned && !globalSessionActive
+                && cameras.Count > 0 && !string.IsNullOrEmpty(txtWorkingFolder.Text);
+            // Global Stop Recording: only enabled when unassigned cameras are actually recording
+            btnStopRecording.Enabled = globalSessionActive;
+        }
+
+        private void ShowGroupsDialog()
+        {
+            using var dlg = new Form
+            {
+                Text = "Camera Groups",
+                Size = new System.Drawing.Size(460, 520),
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterParent,
+                MaximizeBox = false,
+                MinimizeBox = false
+            };
+
+            // Working copies
+            var activeIds = new List<string>(settings.ActiveGroupIds);
+            var groupNames = new Dictionary<string, string>(settings.GroupNames);
+
+            // ---- Group name rows ----
+            var groupNameBoxes = new Dictionary<string, TextBox>();
+            var namesPanel = new Panel { Location = new System.Drawing.Point(10, 10), Size = new System.Drawing.Size(420, 120), BorderStyle = BorderStyle.FixedSingle };
+            var namesPanelLabel = new Label { Text = "Group Names", Location = new System.Drawing.Point(10, 0), Size = new System.Drawing.Size(200, 18), Font = new System.Drawing.Font("Arial", 8, System.Drawing.FontStyle.Bold) };
+            namesPanel.Controls.Add(namesPanelLabel);
+            dlg.Controls.Add(namesPanel);
+
+            string[] allGroupIds = { "A", "B", "C", "D" };
+            void RebuildNameRows()
+            {
+                var oldControls = namesPanel.Controls.OfType<Control>()
+                    .Where(c => c != namesPanelLabel).ToList();
+                foreach (var c in oldControls) namesPanel.Controls.Remove(c);
+                groupNameBoxes.Clear();
+                int ny = 20;
+                foreach (var gid in activeIds)
+                {
+                    var sw = new Label
+                    {
+                        Size = new System.Drawing.Size(14, 14),
+                        BackColor = GroupColors.GetValueOrDefault(gid, System.Drawing.Color.Gray),
+                        BorderStyle = BorderStyle.FixedSingle,
+                        Location = new System.Drawing.Point(8, ny + 2)
+                    };
+                    namesPanel.Controls.Add(sw);
+                    var tb = new TextBox
+                    {
+                        Text = groupNames.GetValueOrDefault(gid, $"Group {gid}"),
+                        Location = new System.Drawing.Point(28, ny),
+                        Size = new System.Drawing.Size(180, 22),
+                        Tag = gid
+                    };
+                    namesPanel.Controls.Add(tb);
+                    groupNameBoxes[gid] = tb;
+                    ny += 26;
+                }
+            }
+            RebuildNameRows();
+
+            var btnAddGroup = new Button { Text = "+ Add Group", Location = new System.Drawing.Point(10, 136), Size = new System.Drawing.Size(90, 26) };
+            var btnRemoveGroup = new Button { Text = "− Remove Last", Location = new System.Drawing.Point(108, 136), Size = new System.Drawing.Size(100, 26) };
+            dlg.Controls.Add(btnAddGroup);
+            dlg.Controls.Add(btnRemoveGroup);
+            btnAddGroup.Click += (s, e) =>
+            {
+                if (activeIds.Count >= 4) { MessageBox.Show("Maximum 4 groups.", "Limit", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                foreach (var id in allGroupIds)
+                {
+                    if (!activeIds.Contains(id)) { activeIds.Add(id); break; }
+                }
+                RebuildNameRows();
+                namesPanel.Refresh();
+            };
+            btnRemoveGroup.Click += (s, e) =>
+            {
+                if (activeIds.Count <= 1) { MessageBox.Show("At least 1 group required.", "Limit", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                activeIds.RemoveAt(activeIds.Count - 1);
+                RebuildNameRows();
+                namesPanel.Refresh();
+            };
+
+            // ---- Camera assignment table ----
+            var assignPanel = new Panel { Location = new System.Drawing.Point(10, 172), Size = new System.Drawing.Size(420, 250), BorderStyle = BorderStyle.FixedSingle, AutoScroll = true };
+            var assignLabel = new Label { Text = "Camera Assignments (select group or None)", Location = new System.Drawing.Point(4, 2), Size = new System.Drawing.Size(380, 18), Font = new System.Drawing.Font("Arial", 8, System.Drawing.FontStyle.Bold) };
+            assignPanel.Controls.Add(assignLabel);
+            dlg.Controls.Add(assignPanel);
+
+            var assignRadios = new Dictionary<string, Dictionary<string, RadioButton>>(); // cam→groupId→radio
+            int ay = 22;
+            foreach (var cam in cameras)
+            {
+                bool isRecordingCam = cam.RecordingStartTime.HasValue && IsCameraRecording(cam);
+
+                // Camera name label (outside the row panel so it's not clipped)
+                var camLabel = new Label { Text = cam.CustomName, Location = new System.Drawing.Point(4, ay + 2), Size = new System.Drawing.Size(110, 20), Font = new System.Drawing.Font("Arial", 8) };
+                assignPanel.Controls.Add(camLabel);
+
+                // Each camera gets its own Panel so its RadioButtons are mutually exclusive only within that row
+                var rowPanel = new Panel { Location = new System.Drawing.Point(116, ay), Size = new System.Drawing.Size(295, 22) };
+                assignPanel.Controls.Add(rowPanel);
+
+                int rx = 0;
+                var camRadios = new Dictionary<string, RadioButton>();
+                // None radio
+                var noneRadio = new RadioButton { Text = "None", Location = new System.Drawing.Point(rx, 1), Size = new System.Drawing.Size(55, 20), Checked = string.IsNullOrEmpty(cam.GroupId), Enabled = !isRecordingCam, Tag = "" };
+                rowPanel.Controls.Add(noneRadio);
+                camRadios[""] = noneRadio;
+                rx += 58;
+                foreach (var gid in allGroupIds)
+                {
+                    var rb = new RadioButton { Text = gid, Location = new System.Drawing.Point(rx, 1), Size = new System.Drawing.Size(36, 20), Checked = cam.GroupId == gid, Enabled = !isRecordingCam && activeIds.Contains(gid), Tag = gid };
+                    rowPanel.Controls.Add(rb);
+                    camRadios[gid] = rb;
+                    rx += 38;
+                }
+                assignRadios[cam.DeviceName] = camRadios;
+                ay += 24;
+            }
+
+            // ---- OK / Cancel ----
+            var btnOK = new Button { Text = "OK", Location = new System.Drawing.Point(230, 432), Size = new System.Drawing.Size(90, 28), DialogResult = DialogResult.OK };
+            var btnCancel = new Button { Text = "Cancel", Location = new System.Drawing.Point(330, 432), Size = new System.Drawing.Size(80, 28), DialogResult = DialogResult.Cancel };
+            dlg.Controls.Add(btnOK);
+            dlg.Controls.Add(btnCancel);
+            dlg.AcceptButton = btnOK;
+            dlg.CancelButton = btnCancel;
+
+            if (dlg.ShowDialog(this) == DialogResult.OK)
+            {
+                // Save group names
+                foreach (var gid in activeIds)
+                {
+                    if (groupNameBoxes.TryGetValue(gid, out var tb))
+                        groupNames[gid] = tb.Text;
+                }
+                settings.GroupNames = groupNames;
+                settings.ActiveGroupIds = new List<string>(activeIds);
+
+                // Save camera assignments
+                foreach (var cam in cameras)
+                {
+                    if (!assignRadios.TryGetValue(cam.DeviceName, out var radios)) continue;
+                    string chosenGroup = "";
+                    foreach (var kvp in radios)
+                        if (kvp.Value.Checked) { chosenGroup = kvp.Key; break; }
+                    cam.GroupId = chosenGroup;
+                    settings.CameraGroupAssignments[cam.DeviceName] = chosenGroup;
+                }
+                settings.Save();
+                UpdateGroupButtonRow();
+                UpdateCameraLayout();
+                UpdateLoopAvailability();
+            }
+        }
+
         private void BtnManageCameras_Click(object? sender, EventArgs e)
         {
-            // Stop live preview if running (we'll restart after)
-            bool wasLive = cameras.Any(c => c.ImagingControl.LiveVideoRunning);
-            
+            bool wasLive = cameras.Any(c => c.IsImagingSource && c.ImagingControl.LiveVideoRunning);
+            bool wasWebcamLive = cameras.Any(c => !c.IsImagingSource && c.WebcamCapture != null);
+
             if (isRecording)
             {
                 MessageBox.Show("Cannot manage cameras while recording!\n\nStop recording first.",
                                 "Recording Active", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            
-            // Get all available devices
-            List<string> allDevices = new List<string>();
+
+            // Enumerate TIS devices
+            List<string> allTisDevices = new List<string>();
             using (var tempControl = new ICImagingControl())
             {
                 var devices = tempControl.Devices;
                 if (devices != null)
-                {
-                    allDevices = devices.Select(d => d.Name).ToList();
-                }
+                    allTisDevices = devices.Select(d => d.Name).ToList();
             }
-            
-            if (allDevices.Count == 0)
+
+            // Enumerate webcam devices (DirectShow devices not in TIS list)
+            var tisNameSet = new HashSet<string>(allTisDevices, StringComparer.OrdinalIgnoreCase);
+            var allWebcamDevices = DirectShowHelper.EnumerateVideoDevices()
+                                    .Where(d => !tisNameSet.Contains(d.Name)).ToList();
+
+            if (allTisDevices.Count == 0 && allWebcamDevices.Count == 0)
             {
                 MessageBox.Show("No cameras detected!", "No Cameras", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            
+
+            // Unified device list: (Name, IsWebcam, WebcamIndex)
+            var deviceEntries = new List<(string Name, bool IsWebcam, int WebcamIndex)>();
+            foreach (var d in allTisDevices)
+                deviceEntries.Add((d, false, -1));
+            foreach (var (name, idx) in allWebcamDevices)
+                deviceEntries.Add((name, true, idx));
+
             // Create dialog
             Form manageForm = new Form
             {
@@ -4073,9 +4614,9 @@ namespace QueenPix
                 MaximizeBox = false,
                 MinimizeBox = false
             };
-            
+
             int y = 20;
-            
+
             Label lblInfo = new Label
             {
                 Text = "Select which cameras to use:",
@@ -4085,7 +4626,7 @@ namespace QueenPix
             };
             manageForm.Controls.Add(lblInfo);
             y += 30;
-            
+
             Label lblNote = new Label
             {
                 Text = "Unchecked cameras will be removed from the session.\nCheck to re-add previously removed cameras.",
@@ -4096,29 +4637,29 @@ namespace QueenPix
             };
             manageForm.Controls.Add(lblNote);
             y += 45;
-            
-            // Create checkboxes for each detected device
+
             List<CheckBox> deviceCheckboxes = new List<CheckBox>();
-            
-            foreach (string device in allDevices)
+
+            foreach (var (name, isWebcam, _) in deviceEntries)
             {
-                bool isCurrentlyActive = cameras.Any(c => c.DeviceName == device);
-                bool isExcluded = excludedCameraDevices.Contains(device);
-                
+                bool isCurrentlyActive = cameras.Any(c => c.DeviceName == name);
+                bool isExcluded = excludedCameraDevices.Contains(name);
+
+                string label = isWebcam ? $"{name} (Webcam)" : name;
+
                 CheckBox chkDevice = new CheckBox
                 {
-                    Text = device,
+                    Text = label,
                     Location = new System.Drawing.Point(40, y),
                     Size = new System.Drawing.Size(400, 25),
-                    Checked = isCurrentlyActive && !isExcluded,
+                    Checked = !isExcluded,
                     Font = new System.Drawing.Font("Arial", 9)
                 };
-                
-                // Add status indicator
+
                 if (isCurrentlyActive)
                 {
                     chkDevice.Text += " (active)";
-                    chkDevice.ForeColor = System.Drawing.Color.Green;
+                    chkDevice.ForeColor = isWebcam ? System.Drawing.Color.DarkBlue : System.Drawing.Color.Green;
                 }
                 else if (isExcluded)
                 {
@@ -4130,44 +4671,34 @@ namespace QueenPix
                     chkDevice.Text += " (new)";
                     chkDevice.ForeColor = System.Drawing.Color.Blue;
                 }
-                
+
                 manageForm.Controls.Add(chkDevice);
                 deviceCheckboxes.Add(chkDevice);
                 y += 30;
             }
-            
+
             y += 20;
-            
-            // Select All / Deselect All buttons
+
             Button btnSelectAll = new Button
             {
                 Text = "Select All",
                 Location = new System.Drawing.Point(120, y),
                 Size = new System.Drawing.Size(100, 30)
             };
-            btnSelectAll.Click += (s, ev) =>
-            {
-                foreach (var chk in deviceCheckboxes)
-                    chk.Checked = true;
-            };
+            btnSelectAll.Click += (s, ev) => { foreach (var chk in deviceCheckboxes) chk.Checked = true; };
             manageForm.Controls.Add(btnSelectAll);
-            
+
             Button btnDeselectAll = new Button
             {
                 Text = "Deselect All",
                 Location = new System.Drawing.Point(230, y),
                 Size = new System.Drawing.Size(100, 30)
             };
-            btnDeselectAll.Click += (s, ev) =>
-            {
-                foreach (var chk in deviceCheckboxes)
-                    chk.Checked = false;
-            };
+            btnDeselectAll.Click += (s, ev) => { foreach (var chk in deviceCheckboxes) chk.Checked = false; };
             manageForm.Controls.Add(btnDeselectAll);
-            
+
             y += 50;
-            
-            // OK/Cancel buttons
+
             Button btnCancel = new Button
             {
                 Text = "Cancel",
@@ -4176,7 +4707,7 @@ namespace QueenPix
                 DialogResult = DialogResult.Cancel
             };
             manageForm.Controls.Add(btnCancel);
-            
+
             Button btnApply = new Button
             {
                 Text = "Apply",
@@ -4185,63 +4716,83 @@ namespace QueenPix
                 DialogResult = DialogResult.OK
             };
             manageForm.Controls.Add(btnApply);
-            
+
             manageForm.AcceptButton = btnApply;
             manageForm.CancelButton = btnCancel;
-            
-            // Adjust form height based on number of devices
             manageForm.Height = Math.Max(400, y + 80);
-            
+
             if (manageForm.ShowDialog() == DialogResult.OK)
             {
                 // Update excluded devices list
                 excludedCameraDevices.Clear();
-                
-                for (int i = 0; i < allDevices.Count; i++)
+                for (int i = 0; i < deviceEntries.Count; i++)
                 {
                     if (!deviceCheckboxes[i].Checked)
-                    {
-                        excludedCameraDevices.Add(allDevices[i]);
-                    }
+                        excludedCameraDevices.Add(deviceEntries[i].Name);
                 }
-                
+
                 // Check if anything actually changed
                 var currentDevices = cameras.Select(c => c.DeviceName).ToHashSet();
-                var newActiveDevices = allDevices.Where(d => !excludedCameraDevices.Contains(d)).ToHashSet();
-                
+                var newActiveDevices = deviceEntries
+                    .Where(d => !excludedCameraDevices.Contains(d.Name))
+                    .Select(d => d.Name).ToHashSet();
+
                 if (!currentDevices.SetEquals(newActiveDevices))
                 {
-                    // Stop live if running
+                    // Stop all live cameras
                     if (wasLive)
                     {
-                        foreach (var camera in cameras)
-                        {
+                        foreach (var camera in cameras.Where(c => c.IsImagingSource))
                             try { camera.ImagingControl.LiveStop(); } catch { }
+                    }
+                    if (wasWebcamLive)
+                    {
+                        foreach (var camera in cameras.Where(c => !c.IsImagingSource))
+                        {
+                            camera.WebcamCts?.Cancel();
+                            camera.WebcamThread?.Join(1000);
+                            camera.WebcamCapture?.Dispose();
+                            camera.WebcamCapture = null;
                         }
                     }
-                    
-                    // Rebuild camera list
+
                     RebuildCameraList();
-                    
-                    // Restart live if it was running
-                    if (wasLive && cameras.Count > 0)
+
+                    // Restart live if any cameras were running
+                    if ((wasLive || wasWebcamLive) && cameras.Count > 0)
                     {
                         foreach (var camera in cameras)
                         {
                             try
                             {
-                                camera.ImagingControl.LiveStart();
-                                camera.LastFpsUpdate = DateTime.Now;
-                                camera.FrameCount = 0;
+                                if (camera.IsImagingSource)
+                                {
+                                    camera.ImagingControl.LiveStart();
+                                    camera.LastFpsUpdate = DateTime.Now;
+                                    camera.FrameCount = 0;
+                                }
+                                else
+                                {
+                                    camera.WebcamCts = new CancellationTokenSource();
+                                    camera.WebcamCapture = new VideoCapture(camera.WebcamDeviceIndex, (VideoCaptureAPIs)700);
+                                    camera.WebcamCapture.Set(VideoCaptureProperties.FrameWidth, camera.WebcamResolution.Width);
+                                    camera.WebcamCapture.Set(VideoCaptureProperties.FrameHeight, camera.WebcamResolution.Height);
+                                    camera.LastFpsUpdate = DateTime.Now;
+                                    camera.WebcamFrameCount = 0;
+                                    var wc = camera;
+                                    camera.WebcamThread = new Thread(() => RunWebcamCaptureLoop(wc));
+                                    camera.WebcamThread.IsBackground = true;
+                                    camera.WebcamThread.Start();
+                                }
                             }
                             catch { }
                         }
-                        
+
                         btnStartLive.Enabled = false;
                         btnStopLive.Enabled = true;
                         btnStartRecording.Enabled = true;
                     }
-                    
+
                     MessageBox.Show($"Camera configuration updated!\n\nActive cameras: {cameras.Count}",
                                     "Cameras Updated", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
@@ -4252,50 +4803,54 @@ namespace QueenPix
             // Save current custom names before clearing
             Dictionary<string, string> savedNames = new Dictionary<string, string>();
             foreach (var cam in cameras)
-            {
                 savedNames[cam.DeviceName] = cam.CustomName;
-            }
-            
-            // Clear existing cameras from UI
+
+            // Clear existing cameras from UI (handle both TIS and webcam)
             foreach (var cam in cameras)
             {
-                try
+                if (cam.IsImagingSource)
                 {
-                    if (cam.ImagingControl.LiveVideoRunning)
-                    {
-                        cam.ImagingControl.LiveStop();
-                    }
+                    try { if (cam.ImagingControl.LiveVideoRunning) cam.ImagingControl.LiveStop(); } catch { }
+                    this.Controls.Remove(cam.ImagingControl);
+                    cam.ImagingControl.Dispose();
                 }
-                catch { }
-                
-                this.Controls.Remove(cam.ImagingControl);
+                else
+                {
+                    cam.WebcamCts?.Cancel();
+                    cam.WebcamThread?.Join(500);
+                    cam.WebcamCapture?.Dispose();
+                    cam.WebcamLastFrame?.Dispose();
+                    if (cam.WebcamPreview != null)
+                        this.Controls.Remove(cam.WebcamPreview);
+                }
+
                 this.Controls.Remove(cam.NameLabel);
                 this.Controls.Remove(cam.FpsLabel);
                 this.Controls.Remove(cam.NameTextBox);
                 this.Controls.Remove(cam.SettingsButton);
-                cam.ImagingControl.Dispose();
+                if (cam.TriggerButton != null)
+                    this.Controls.Remove(cam.TriggerButton);
+                if (cam.GroupIndicatorLabel != null)
+                {
+                    this.Controls.Remove(cam.GroupIndicatorLabel);
+                    cam.GroupIndicatorLabel = null;
+                }
             }
             cameras.Clear();
-            
-            // Get all available devices
-            string[] deviceNames;
+
+            // Get TIS devices (empty is OK — webcams may still exist)
+            string[] deviceNames = Array.Empty<string>();
             using (var tempControl = new ICImagingControl())
             {
                 var devices = tempControl.Devices;
-                if (devices == null || devices.Length == 0)
-                {
-                    btnStartLive.Enabled = false;
-                    btnStopLive.Enabled = false;
-                    btnStartRecording.Enabled = false;
-                    UpdateRamEstimate();
-                    return;
-                }
-                deviceNames = devices.Select(d => d.Name).ToArray();
+                if (devices != null && devices.Length > 0)
+                    deviceNames = devices.Select(d => d.Name).ToArray();
             }
-            
-            System.Threading.Thread.Sleep(200);
-            
-            // Filter out excluded devices
+
+            if (deviceNames.Length > 0)
+                System.Threading.Thread.Sleep(200);
+
+            // Filter out excluded TIS devices
             var activeDevices = deviceNames.Where(d => !excludedCameraDevices.Contains(d)).ToList();
             
             // Create camera controls for active devices only
@@ -4347,20 +4902,35 @@ namespace QueenPix
                 camera.SettingsButton.Click += (s, e) => ShowCameraSettings(cameraIndex);
                 this.Controls.Add(camera.SettingsButton);
                 camera.SettingsButton.BringToFront();
+
+                // Trigger button - positioned to the left of Settings button
+                camera.TriggerButton = new Button
+                {
+                    Text = "🔘 Trigger",
+                    Location = new System.Drawing.Point(xPosition + CAMERA_WIDTH - 160, yPosition + 42),
+                    Size = new System.Drawing.Size(75, 22),
+                    Font = new System.Drawing.Font("Arial", 7)
+                };
+                int triggerCameraIndex2 = i; // Capture index for event handler
+                camera.TriggerButton.Click += (s, e) => ToggleCameraTrigger(triggerCameraIndex2);
+                this.Controls.Add(camera.TriggerButton);
+                camera.TriggerButton.BringToFront();
                 
                 // Load saved settings for this camera if available
                 if (settings.CameraSettingsByDevice.ContainsKey(deviceName))
                 {
                     camera.Settings = settings.CameraSettingsByDevice[deviceName];
                 }
-                
+                if (settings.CameraGroupAssignments.TryGetValue(deviceName, out string? rbGid))
+                    camera.GroupId = rbGid ?? "";
+
                 camera.FpsLabel.Text = "Ready";
                 camera.FpsLabel.Location = new System.Drawing.Point(xPosition, yPosition + 45);
                 camera.FpsLabel.Size = new System.Drawing.Size(CAMERA_WIDTH, 20);
                 camera.FpsLabel.ForeColor = System.Drawing.Color.Green;
                 camera.FpsLabel.Font = new System.Drawing.Font("Arial", 8, System.Drawing.FontStyle.Bold);
                 this.Controls.Add(camera.FpsLabel);
-                
+
                 camera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 68);
                 camera.ImagingControl.Size = new System.Drawing.Size(CAMERA_WIDTH, CAMERA_HEIGHT);
                 camera.ImagingControl.Name = $"icImagingControl{i + 1}";
@@ -4438,7 +5008,112 @@ namespace QueenPix
                 this.Controls.Add(camera.ImagingControl);
                 cameras.Add(camera);
             }
-            
+
+            // ---- Webcam creation (same filtering via excludedCameraDevices) ----
+            var tisNameSet2 = new HashSet<string>(deviceNames, StringComparer.OrdinalIgnoreCase);
+            var allDirectShowDevices2 = DirectShowHelper.EnumerateVideoDevices();
+            var webcamDevices2 = allDirectShowDevices2
+                .Where(d => !tisNameSet2.Contains(d.Name) && !excludedCameraDevices.Contains(d.Name))
+                .ToList();
+
+            int webcamStartIndex2 = cameras.Count;
+            for (int wi = 0; wi < webcamDevices2.Count; wi++)
+            {
+                var (wcName, wcIndex) = webcamDevices2[wi];
+                int camIdx = webcamStartIndex2 + wi;
+
+                var camera = new CameraControl(wcName)
+                {
+                    IsImagingSource = false,
+                    WebcamDeviceIndex = wcIndex,
+                };
+                camera.Settings.IsImagingSource = false;
+
+                int xPosition = SIDE_MARGIN + (camIdx * (CAMERA_WIDTH + CAMERA_SPACING));
+                int yPosition = TOP_MARGIN;
+
+                string customName = savedNames.ContainsKey(wcName) ? savedNames[wcName] : $"Camera{camIdx + 1}";
+                camera.CustomName = customName;
+
+                camera.NameTextBox = new TextBox
+                {
+                    Text = customName,
+                    Location = new System.Drawing.Point(xPosition, yPosition),
+                    Size = new System.Drawing.Size(CAMERA_WIDTH - 10, 20),
+                    Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold),
+                    BorderStyle = BorderStyle.FixedSingle
+                };
+                int capturedWcIdx = camIdx;
+                camera.NameTextBox.TextChanged += (s, e) =>
+                {
+                    if (capturedWcIdx < cameras.Count)
+                        cameras[capturedWcIdx].CustomName = camera.NameTextBox.Text;
+                };
+                this.Controls.Add(camera.NameTextBox);
+
+                camera.NameLabel.Text = wcName + " (Webcam)";
+                camera.NameLabel.Location = new System.Drawing.Point(xPosition, yPosition + 22);
+                camera.NameLabel.AutoSize = false;
+                camera.NameLabel.Size = new System.Drawing.Size(CAMERA_WIDTH, 18);
+                camera.NameLabel.Font = new System.Drawing.Font("Arial", 7);
+                camera.NameLabel.ForeColor = System.Drawing.Color.DarkBlue;
+                this.Controls.Add(camera.NameLabel);
+
+                camera.SettingsButton = new Button
+                {
+                    Text = "⚙️ Settings",
+                    Location = new System.Drawing.Point(xPosition + CAMERA_WIDTH - 80, yPosition + 42),
+                    Size = new System.Drawing.Size(75, 22),
+                    Font = new System.Drawing.Font("Arial", 7)
+                };
+                int settingsCamIdx = camIdx;
+                camera.SettingsButton.Click += (s, e) => ShowCameraSettings(settingsCamIdx);
+                this.Controls.Add(camera.SettingsButton);
+                camera.SettingsButton.BringToFront();
+
+                camera.FpsLabel.Text = "Ready";
+                camera.FpsLabel.Location = new System.Drawing.Point(xPosition, yPosition + 45);
+                camera.FpsLabel.Size = new System.Drawing.Size(CAMERA_WIDTH - 90, 20);
+                camera.FpsLabel.ForeColor = System.Drawing.Color.DarkBlue;
+                camera.FpsLabel.Font = new System.Drawing.Font("Arial", 8, System.Drawing.FontStyle.Bold);
+                this.Controls.Add(camera.FpsLabel);
+
+                camera.WebcamPreview = new System.Windows.Forms.PictureBox
+                {
+                    Location = new System.Drawing.Point(xPosition, yPosition + 68),
+                    Size = new System.Drawing.Size(CAMERA_WIDTH, CAMERA_HEIGHT),
+                    SizeMode = System.Windows.Forms.PictureBoxSizeMode.StretchImage,
+                    BackColor = System.Drawing.Color.Black
+                };
+                int previewCamIdx = camIdx;
+                camera.WebcamPreview.MouseClick += (s, e) => ToggleCameraExpansion(previewCamIdx);
+                this.Controls.Add(camera.WebcamPreview);
+
+                if (settings.CameraSettingsByDevice.ContainsKey(wcName))
+                {
+                    camera.Settings = settings.CameraSettingsByDevice[wcName];
+                    camera.Settings.IsImagingSource = false;
+                    if (!string.IsNullOrEmpty(camera.Settings.Format) && camera.Settings.Format.Contains("x"))
+                    {
+                        var parts = camera.Settings.Format.Split('x');
+                        if (parts.Length == 2 && int.TryParse(parts[0], out int sw) && int.TryParse(parts[1], out int sh))
+                            camera.WebcamResolution = (sw, sh);
+                    }
+                }
+                else
+                {
+                    camera.Settings.Format = "640x480";
+                    camera.WebcamResolution = (640, 480);
+                }
+                if (settings.CameraGroupAssignments.TryGetValue(wcName, out string? rbWcGid))
+                    camera.GroupId = rbWcGid ?? "";
+
+                cameras.Add(camera);
+            }
+
+            UpdateLoopAvailability();
+            UpdateGroupButtonRow();
+
             if (cameras.Count > 0)
             {
                 btnStartLive.Enabled = true;
@@ -4450,22 +5125,147 @@ namespace QueenPix
                 btnStopLive.Enabled = false;
                 btnStartRecording.Enabled = false;
             }
-            
+
             // Adjust window width
             int requiredWidth = SIDE_MARGIN * 2 + (cameras.Count * (CAMERA_WIDTH + CAMERA_SPACING));
             if (requiredWidth > this.Width)
             {
-                // Allow window to be wider than screen for horizontal scrolling
-                // Cap at reasonable maximum (5000px) to prevent excessive width
                 this.Width = Math.Min(requiredWidth, 5000);
             }
-            
+
             UpdateRamEstimate();
             if (cmbPreviewSize != null && cmbLayoutMode != null)
             {
                 UpdateCameraLayout();
             }
         }
+        private void ToggleCameraTrigger(int cameraIndex)
+        {
+            if (cameraIndex < 0 || cameraIndex >= cameras.Count)
+                return;
+            
+            var camera = cameras[cameraIndex];
+            
+            try
+            {
+                if (!camera.ImagingControl.DeviceValid)
+                {
+                    MessageBox.Show("Camera is not properly connected.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                
+                if (camera.ImagingControl.VCDPropertyItems == null)
+                {
+                    MessageBox.Show("Camera properties not available.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                
+                // Try to find and toggle trigger-related properties using the correct API
+                // Based on TIS.Imaging SDK documentation: iterate through Items -> Elements -> Interfaces
+                bool triggerToggled = false;
+                string[] triggerPropertyNames = { "Trigger", "Trigger On/Off", "TriggerMode", "TriggerSoftware", "Trigger Software", "TriggerEnable" };
+                
+                try
+                {
+                    var propertyItems = camera.ImagingControl.VCDPropertyItems;
+                    
+                    // Iterate through all VCDPropertyItems
+                    foreach (VCDPropertyItem propertyItem in propertyItems)
+                    {
+                        try
+                        {
+                            string propName = propertyItem.Name ?? "";
+                            
+                            // Check if this property name matches any trigger property
+                            bool isTriggerProperty = false;
+                            foreach (string triggerName in triggerPropertyNames)
+                            {
+                                if (propName.IndexOf(triggerName, StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    isTriggerProperty = true;
+                                    break;
+                                }
+                            }
+                            
+                            if (!isTriggerProperty) continue;
+                            
+                            // Iterate through all Elements of this property
+                            foreach (VCDPropertyElement propertyElement in propertyItem.Elements)
+                            {
+                                // Iterate through all Interfaces of this element
+                                foreach (VCDPropertyInterface propertyInterface in propertyElement)
+                                {
+                                    try
+                                    {
+                                        // Check if it's a Switch interface (on/off toggle)
+                                        if (propertyInterface.InterfaceGUID == VCDGUIDs.VCDInterface_Switch)
+                                        {
+                                            VCDSwitchProperty switchProp = (VCDSwitchProperty)propertyInterface;
+                                            if (!switchProp.ReadOnly)
+                                            {
+                                                bool currentValue = switchProp.Switch;
+                                                switchProp.Switch = !currentValue;
+                                                triggerToggled = true;
+                                                LogCameraInfo($"Camera {cameraIndex + 1}: Trigger ({propName}) toggled to {!currentValue}");
+                                                break;
+                                            }
+                                        }
+                                        // Check if it's a Button interface (execute/push)
+                                        else if (propertyInterface.InterfaceGUID == VCDGUIDs.VCDInterface_Button)
+                                        {
+                                            VCDButtonProperty buttonProp = (VCDButtonProperty)propertyInterface;
+                                            if (!buttonProp.ReadOnly)
+                                            {
+                                                buttonProp.Push();
+                                                triggerToggled = true;
+                                                LogCameraInfo($"Camera {cameraIndex + 1}: Trigger ({propName}) executed");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    catch (Exception interfaceEx)
+                                    {
+                                        LogCameraInfo($"Error accessing interface: {interfaceEx.Message}");
+                                    }
+                                }
+                                
+                                if (triggerToggled) break;
+                            }
+                            
+                            if (triggerToggled) break;
+                        }
+                        catch (Exception itemEx)
+                        {
+                            LogCameraInfo($"Error accessing property item: {itemEx.Message}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogCameraInfo($"Error accessing properties: {ex.Message}");
+                }
+                
+                if (!triggerToggled)
+                {
+                    // Fallback: Open properties dialog if we can't toggle programmatically
+                    camera.ImagingControl.ShowPropertyDialog();
+                    LogCameraInfo($"Camera {cameraIndex + 1}: Could not toggle trigger programmatically, opened properties dialog");
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error toggling trigger: {ex.Message}\n\n" +
+                              "Opening properties dialog instead...",
+                              "Error", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                try
+                {
+                    camera.ImagingControl.ShowPropertyDialog();
+                }
+                catch { }
+                LogCameraInfo($"Error toggling trigger for camera {cameraIndex + 1}: {ex.Message}");
+            }
+        }
+
         private void ShowCameraSettings(int cameraIndex)
         {
             if (cameraIndex >= cameras.Count)
@@ -4481,21 +5281,50 @@ namespace QueenPix
                 return;
             }
             
-            // Track if ANY camera is currently live
-            wasLiveBeforeSettings = cameras.Any(c => c.ImagingControl.LiveVideoRunning);
+            // For TIS cameras, validate device is ready
+            if (camera.IsImagingSource && !camera.ImagingControl.DeviceValid)
+            {
+                MessageBox.Show("Camera is not properly connected or initialized.\n\n" +
+                              "Possible causes:\n" +
+                              "1. TIS.Imaging SDK not installed - Run the SDK installer\n" +
+                              "2. Camera driver not installed\n" +
+                              "3. Camera disconnected\n\n" +
+                              "Please:\n" +
+                              "- Install TIS.Imaging SDK from Installers\\TIS_Imaging_SDK_Installer.exe\n" +
+                              "- Click 'Refresh Cameras' to reconnect",
+                              "Camera Not Ready", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
-            bool wasLive = camera.ImagingControl.LiveVideoRunning;
+            // Track if ANY TIS camera is currently live
+            wasLiveBeforeSettings = cameras.Any(c => c.IsImagingSource && c.ImagingControl.LiveVideoRunning);
+            bool wasLive = camera.IsImagingSource && camera.ImagingControl.LiveVideoRunning;
 
             // Store current settings to detect what changed
             string oldFormat = camera.Settings.Format;
             bool oldUseExternalTrigger = camera.Settings.UseExternalTrigger;
             float oldSoftwareFrameRate = camera.Settings.SoftwareFrameRate;
 
-            // DON'T stop camera - let it run so Update button works in property dialog
+            // DON'T stop TIS camera - let it run so Update button works in property dialog
+
+            // For webcams: stop capture BEFORE opening dialog so GetSupportedResolutions()
+            // can open the device freely (most webcams only allow one capture at a time)
+            bool webcamWasRunning = !camera.IsImagingSource && camera.WebcamCapture != null;
+            if (webcamWasRunning)
+            {
+                camera.WebcamCts?.Cancel();
+                camera.WebcamThread?.Join(2000);
+                camera.WebcamCapture?.Dispose();
+                camera.WebcamCapture = null;
+                if (camera.WebcamPreview != null) camera.WebcamPreview.Image = null;
+            }
 
             // Show settings dialog
             string currentRecordingMode = cmbRecordingMode.SelectedItem?.ToString() ?? "";
-            using (CameraSettingsDialog dialog = new CameraSettingsDialog(camera.ImagingControl, camera.Settings, cameraIndex + 1, currentRecordingMode))
+            using (CameraSettingsDialog dialog = new CameraSettingsDialog(
+                camera.IsImagingSource ? camera.ImagingControl : null,
+                camera.Settings, cameraIndex + 1, currentRecordingMode,
+                camera.IsImagingSource, camera.WebcamDeviceIndex))
             {
                 if (dialog.ShowDialog() == DialogResult.OK)
                 {
@@ -4505,58 +5334,65 @@ namespace QueenPix
                     bool triggerModeChanged = dialog.Settings.UseExternalTrigger != oldUseExternalTrigger;
                     bool fpsChanged = dialog.Settings.SoftwareFrameRate != oldSoftwareFrameRate;
                     
-                    bool needsRefresh = formatChanged || triggerModeChanged || fpsChanged;
+                    // Webcams: resolution update is handled inline; no full DetectAndSetupCameras needed
+                    bool needsRefresh = camera.IsImagingSource && (formatChanged || triggerModeChanged || fpsChanged);
                     
                     // Save settings for current camera
                     camera.Settings = dialog.Settings;
                     settings.CameraSettingsByDevice[camera.DeviceName] = dialog.Settings.Clone();
+
+                    // For webcams, update the resolution tuple from the format string
+                    if (!camera.IsImagingSource && !string.IsNullOrEmpty(dialog.Settings.Format))
+                    {
+                        var parts = dialog.Settings.Format.Split('x');
+                        if (parts.Length == 2 && int.TryParse(parts[0], out int rw) && int.TryParse(parts[1], out int rh))
+                            camera.WebcamResolution = (rw, rh);
+                    }
                     
-                    // If "Save for All Cameras" was clicked, apply settings to all other cameras
+                    // If "Save for All Cameras" was clicked, apply to cameras of the SAME type only
                     if (dialog.ApplyToAllCameras)
                     {
                         int appliedCount = 0;
                         for (int i = 0; i < cameras.Count; i++)
                         {
-                            if (i != cameraIndex) // Skip the current camera (already saved)
+                            if (i == cameraIndex) continue; // Skip the current camera
+                            var otherCamera = cameras[i];
+                            if (otherCamera.IsImagingSource != camera.IsImagingSource) continue; // Different type
+                            try
                             {
-                                try
+                                var clonedSettings = dialog.Settings.Clone();
+                                clonedSettings.DeviceName = otherCamera.DeviceName;
+                                clonedSettings.IsImagingSource = otherCamera.IsImagingSource;
+                                otherCamera.Settings = clonedSettings;
+                                settings.CameraSettingsByDevice[otherCamera.DeviceName] = clonedSettings.Clone();
+
+                                if (otherCamera.IsImagingSource && otherCamera.ImagingControl.DeviceValid)
                                 {
-                                    var otherCamera = cameras[i];
-                                    
-                                    // Clone settings but keep the device name
-                                    var clonedSettings = dialog.Settings.Clone();
-                                    clonedSettings.DeviceName = otherCamera.DeviceName;
-                                    
-                                    // Apply settings to this camera
-                                    otherCamera.Settings = clonedSettings;
-                                    settings.CameraSettingsByDevice[otherCamera.DeviceName] = clonedSettings.Clone();
-                                    
-                                    // Apply VCD properties if camera is available
-                                    if (otherCamera.ImagingControl.DeviceValid)
+                                    try
                                     {
-                                        try
-                                        {
-                                            if (!string.IsNullOrEmpty(clonedSettings.VCDPropertiesXml) && 
-                                                otherCamera.ImagingControl.VCDPropertyItems != null)
-                                            {
-                                                otherCamera.ImagingControl.VCDPropertyItems.Load(clonedSettings.VCDPropertiesXml);
-                                            }
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            LogCameraInfo($"Warning: Could not apply properties to camera {i + 1} ({otherCamera.DeviceName}): {ex.Message}");
-                                        }
+                                        if (!string.IsNullOrEmpty(clonedSettings.VCDPropertiesXml) &&
+                                            otherCamera.ImagingControl.VCDPropertyItems != null)
+                                            otherCamera.ImagingControl.VCDPropertyItems.Load(clonedSettings.VCDPropertiesXml);
                                     }
-                                    
-                                    appliedCount++;
+                                    catch (Exception ex)
+                                    {
+                                        LogCameraInfo($"Warning: Could not apply properties to camera {i + 1}: {ex.Message}");
+                                    }
                                 }
-                                catch (Exception ex)
+                                else if (!otherCamera.IsImagingSource && !string.IsNullOrEmpty(clonedSettings.Format))
                                 {
-                                    LogCameraInfo($"Error applying settings to camera {i + 1}: {ex.Message}");
+                                    var parts = clonedSettings.Format.Split('x');
+                                    if (parts.Length == 2 && int.TryParse(parts[0], out int rw) && int.TryParse(parts[1], out int rh))
+                                        otherCamera.WebcamResolution = (rw, rh);
                                 }
+
+                                appliedCount++;
+                            }
+                            catch (Exception ex)
+                            {
+                                LogCameraInfo($"Error applying settings to camera {i + 1}: {ex.Message}");
                             }
                         }
-                        
                         LogCameraInfo($"Applied settings from camera {cameraIndex + 1} to {appliedCount} other camera(s)");
                     }
                     
@@ -4580,9 +5416,27 @@ namespace QueenPix
                                 {
                                     try
                                     {
-                                        cameras[i].ImagingControl.LiveStart();
+                                        if (cameras[i].IsImagingSource)
+                                        {
+                                            cameras[i].ImagingControl.LiveStart();
+                                            cameras[i].FrameCount = 0;
+                                        }
+                                        else
+                                        {
+                                            // Webcam: restart capture thread with possibly new resolution
+                                            cameras[i].WebcamCts?.Cancel();
+                                            cameras[i].WebcamThread?.Join(1000);
+                                            cameras[i].WebcamCapture?.Dispose();
+                                            cameras[i].WebcamCts = new CancellationTokenSource();
+                                            cameras[i].WebcamCapture = new VideoCapture(cameras[i].WebcamDeviceIndex, (VideoCaptureAPIs)700);
+                                            cameras[i].WebcamCapture.Set(VideoCaptureProperties.FrameWidth, cameras[i].WebcamResolution.Width);
+                                            cameras[i].WebcamCapture.Set(VideoCaptureProperties.FrameHeight, cameras[i].WebcamResolution.Height);
+                                            var wc = cameras[i];
+                                            cameras[i].WebcamThread = new Thread(() => RunWebcamCaptureLoop(wc));
+                                            cameras[i].WebcamThread.IsBackground = true;
+                                            cameras[i].WebcamThread.Start();
+                                        }
                                         cameras[i].LastFpsUpdate = DateTime.Now;
-                                        cameras[i].FrameCount = 0;
                                         successCount++;
                                     }
                                     catch { }
@@ -4600,9 +5454,31 @@ namespace QueenPix
                         // Only camera properties changed (exposure, gain, etc.)
                         // SDK already applied them via Update/OK button - no refresh needed!
                         LogCameraInfo($"Camera {cameraIndex + 1}: Only camera properties changed - no refresh needed");
-                        
+
                         // Update device name label to show device name only
                         camera.NameLabel.Text = camera.DeviceName;
+                    }
+                }
+
+                // Restart webcam capture (always, whether OK or Cancel — we stopped it above)
+                if (webcamWasRunning)
+                {
+                    try
+                    {
+                        camera.WebcamCts = new CancellationTokenSource();
+                        camera.WebcamCapture = new VideoCapture(camera.WebcamDeviceIndex, (VideoCaptureAPIs)700);
+                        camera.WebcamCapture.Set(VideoCaptureProperties.FrameWidth, camera.WebcamResolution.Width);
+                        camera.WebcamCapture.Set(VideoCaptureProperties.FrameHeight, camera.WebcamResolution.Height);
+                        camera.LastFpsUpdate = DateTime.Now;
+                        camera.WebcamFrameCount = 0;
+                        var wc = camera;
+                        camera.WebcamThread = new Thread(() => RunWebcamCaptureLoop(wc));
+                        camera.WebcamThread.IsBackground = true;
+                        camera.WebcamThread.Start();
+                    }
+                    catch (Exception ex)
+                    {
+                        LogCameraInfo($"Webcam restart after settings error: {ex.Message}");
                     }
                 }
             }
@@ -4717,15 +5593,73 @@ namespace QueenPix
         {
             foreach (var camera in cameras)
             {
-                // Check camera connection status
-                bool isConnected = false;
-                try
+                if (!camera.IsImagingSource)
                 {
-                    isConnected = camera.ImagingControl.DeviceValid;
+                    // Webcam FPS display
+                    DateTime now = DateTime.Now;
+                    double elapsedSeconds = (now - camera.LastFpsUpdate).TotalSeconds;
+                    if (elapsedSeconds > 0)
+                    {
+                        long frames = camera.WebcamFrameCount;
+                        camera.WebcamFrameCount = 0;
+                        double rawFps = frames / elapsedSeconds;
+                        camera.FpsHistory[camera.FpsHistoryIndex % 3] = rawFps;
+                        camera.FpsHistoryIndex++;
+                        double fps = camera.FpsHistory.Average();
+
+                        if (IsCameraRecording(camera))
+                        {
+                            if (camera.IsTimelapseMode)
+                            {
+                                int nextSec = 0;
+                                if (camera.LastTimelapseCapture != null)
+                                {
+                                    double elapsed = (now - camera.LastTimelapseCapture.Value).TotalSeconds;
+                                    nextSec = Math.Max(0, (int)(camera.TimelapseIntervalSeconds - elapsed));
+                                }
+                                camera.FpsLabel.Text = $"⏱️ TIMELAPSE | {camera.TimelapseFrameCount} frames | Next in {nextSec}s";
+                                camera.FpsLabel.ForeColor = System.Drawing.Color.Purple;
+                            }
+                            else
+                            {
+                                double recDuration = (now - camera.RecordingStartTime.Value).TotalSeconds;
+                                if ((now - camera.FileSizeLastChecked).TotalSeconds >= 1.0)
+                                {
+                                    if (camera.RecordingFilePath != null && File.Exists(camera.RecordingFilePath))
+                                    {
+                                        try { camera.CachedFileSizeMB = new FileInfo(camera.RecordingFilePath).Length / (1024 * 1024); }
+                                        catch { }
+                                    }
+                                    camera.FileSizeLastChecked = now;
+                                }
+                                camera.FpsLabel.Text = $"🔴 REC {fps:F1}fps | {camera.CachedFileSizeMB}MB | {recDuration:F1}s";
+                                camera.FpsLabel.ForeColor = System.Drawing.Color.Red;
+                            }
+                        }
+                        else
+                        {
+                            bool isRunning = camera.WebcamCapture != null && camera.WebcamCapture.IsOpened();
+                            if (isRunning)
+                            {
+                                camera.FpsLabel.Text = $"LIVE | {fps:F1} fps";
+                                camera.FpsLabel.ForeColor = System.Drawing.Color.DarkBlue;
+                            }
+                            else
+                            {
+                                camera.FpsLabel.Text = "Ready";
+                                camera.FpsLabel.ForeColor = System.Drawing.Color.DarkBlue;
+                            }
+                        }
+                        camera.LastFpsUpdate = now;
+                    }
+                    continue;
                 }
+
+                // TIS camera FPS display
+                bool isConnected = false;
+                try { isConnected = camera.ImagingControl.DeviceValid; }
                 catch { }
 
-                // Update camera name label with connection status
                 if (!isConnected && !camera.NameLabel.Text.Contains("[DISCONNECTED]"))
                 {
                     camera.NameLabel.Text = $"{camera.DeviceName} [DISCONNECTED]";
@@ -4741,96 +5675,79 @@ namespace QueenPix
                     camera.NameLabel.ForeColor = System.Drawing.Color.Black;
                 }
 
-                DateTime now = DateTime.Now;
-                double elapsedSeconds = (now - camera.LastFpsUpdate).TotalSeconds;
-                
-                if (elapsedSeconds > 0)
+                DateTime tisnow = DateTime.Now;
+                double tisElapsed = (tisnow - camera.LastFpsUpdate).TotalSeconds;
+
+                if (tisElapsed > 0)
                 {
-                    double fps = camera.FrameCount / elapsedSeconds;
-                    
-                    if (isRecording && camera.RecordingStartTime.HasValue)
+                    double fps = camera.FrameCount / tisElapsed;
+
+                    if (IsCameraRecording(camera))
                     {
                         if (camera.IsTimelapseMode)
                         {
-                            // Timelapse mode - show frame count and next capture countdown
                             int nextCaptureSeconds = 0;
                             if (camera.LastTimelapseCapture != null)
                             {
-                                double elapsed = (DateTime.Now - camera.LastTimelapseCapture.Value).TotalSeconds;
+                                double elapsed = (tisnow - camera.LastTimelapseCapture.Value).TotalSeconds;
                                 nextCaptureSeconds = (int)(camera.TimelapseIntervalSeconds - elapsed);
                                 if (nextCaptureSeconds < 0) nextCaptureSeconds = 0;
                             }
-                            
                             camera.FpsLabel.Text = $"⏱️ TIMELAPSE | {camera.TimelapseFrameCount} frames | Next in {nextCaptureSeconds}s";
                             camera.FpsLabel.ForeColor = System.Drawing.Color.Purple;
                         }
                         else if (cmbRecordingMode.SelectedItem?.ToString() == "Loop Recording" && camera.LoopBuffer != null)
                         {
-                            // Loop mode - show buffer status
                             int bufferFrames = 0;
-                            lock (camera.LoopBufferLock)
-                            {
-                                bufferFrames = camera.LoopBuffer.Count;
-                            }
-                            
-                            double expectedFps;
-                            if (camera.Settings.UseExternalTrigger)
-                            {
-                                expectedFps = (double)numExternalTriggerFps.Value;
-                            }
-                            else
-                            {
-                                expectedFps = camera.Settings.SoftwareFrameRate;
-                            }
-                            
+                            lock (camera.LoopBufferLock) { bufferFrames = camera.LoopBuffer.Count; }
+
+                            double expectedFps = camera.Settings.UseExternalTrigger
+                                ? (double)numExternalTriggerFps.Value
+                                : camera.Settings.SoftwareFrameRate;
+
                             double bufferSeconds = bufferFrames / expectedFps;
                             int loopDuration = (int)numLoopDuration.Value;
-                            
                             camera.FpsLabel.Text = $"🔴 LOOP {loopDuration}s | {bufferFrames} frames ({bufferSeconds:F1}s)";
                             camera.FpsLabel.ForeColor = System.Drawing.Color.Orange;
                         }
                         else
                         {
-                            // Normal recording
-                            double recordingDuration = (now - camera.RecordingStartTime.Value).TotalSeconds;
-                            
-                            // Get file size
-                            long fileSize = 0;
-                            if (camera.RecordingFilePath != null && File.Exists(camera.RecordingFilePath))
+                            double recordingDuration = (tisnow - camera.RecordingStartTime.Value).TotalSeconds;
+                            if ((tisnow - camera.FileSizeLastChecked).TotalSeconds >= 1.0)
                             {
-                                try
+                                if (camera.RecordingFilePath != null && File.Exists(camera.RecordingFilePath))
                                 {
-                                    FileInfo fileInfo = new FileInfo(camera.RecordingFilePath);
-                                    fileSize = fileInfo.Length / (1024 * 1024); // MB
+                                    try { camera.CachedFileSizeMB = new FileInfo(camera.RecordingFilePath).Length / (1024 * 1024); }
+                                    catch { }
                                 }
-                                catch { }
+                                camera.FileSizeLastChecked = tisnow;
                             }
-                            
-                            camera.FpsLabel.Text = $"🔴 REC | {fileSize}MB | {recordingDuration:F1}s";
+                            camera.FpsLabel.Text = $"🔴 REC | {camera.CachedFileSizeMB}MB | {recordingDuration:F1}s";
                             camera.FpsLabel.ForeColor = System.Drawing.Color.Red;
                         }
                     }
                     else
                     {
-                        // During live preview - show configured/expected FPS
                         if (camera.Settings.UseExternalTrigger)
-                        {
                             camera.FpsLabel.Text = "LIVE | External trigger";
-                        }
                         else
-                        {
                             camera.FpsLabel.Text = $"LIVE | {camera.Settings.SoftwareFrameRate:F1} fps (software set)";
-                        }
                         camera.FpsLabel.ForeColor = System.Drawing.Color.Green;
                     }
-                    
-                    // Reset counter
+
                     camera.FrameCount = 0;
-                    camera.LastFpsUpdate = now;
+                    camera.LastFpsUpdate = tisnow;
                 }
             }
         }
         
+        private bool IsCameraRecording(CameraControl cam)
+        {
+            if (!cam.RecordingStartTime.HasValue) return false;
+            string key = string.IsNullOrEmpty(cam.GroupId) ? "" : cam.GroupId;
+            return _groupRecording.TryGetValue(key, out bool v) && v;
+        }
+
         private void UpdateCameraLayout()
         {
             if (cameras.Count == 0)
@@ -4862,16 +5779,30 @@ namespace QueenPix
                     cameras[i].NameLabel.Visible = false;
                     cameras[i].FpsLabel.Visible = false;
                     cameras[i].SettingsButton.Visible = false;
+                    cameras[i].TriggerButton.Visible = false;
                     cameras[i].ImagingControl.Visible = false;
+                    if (!cameras[i].IsImagingSource && cameras[i].WebcamPreview != null)
+                        cameras[i].WebcamPreview.Visible = false;
+                    if (cameras[i].GroupIndicatorLabel != null)
+                        cameras[i].GroupIndicatorLabel.Visible = false;
                 }
             }
-            
+
             // Calculate available space for expanded preview
             int availableWidth = this.ClientSize.Width - (SIDE_MARGIN * 2);
             int availableHeight = this.ClientSize.Height - TOP_MARGIN;
 
             // Use actual camera aspect ratio if available, otherwise 4:3
             float aspectRatio = 4.0f / 3.0f; // Default 4:3
+
+            // For webcams, derive aspect ratio from the captured resolution
+            if (!expandedCamera.IsImagingSource)
+            {
+                var res = expandedCamera.WebcamResolution;
+                if (res.Width > 0 && res.Height > 0)
+                    aspectRatio = (float)res.Width / res.Height;
+            }
+            else
             try
             {
                 string? formatStr = null;
@@ -4943,38 +5874,79 @@ namespace QueenPix
             
             expandedCamera.SettingsButton.Location = new System.Drawing.Point(xPosition + expandedWidth - 80, yPosition + 48);
             expandedCamera.SettingsButton.Visible = true;
+            expandedCamera.SettingsButton.BringToFront();
+            
+            expandedCamera.TriggerButton.Location = new System.Drawing.Point(xPosition + expandedWidth - 160, yPosition + 48);
+            expandedCamera.TriggerButton.Visible = true;
+            expandedCamera.TriggerButton.BringToFront();
             
             expandedCamera.FpsLabel.Location = new System.Drawing.Point(xPosition, yPosition + 50);
             expandedCamera.FpsLabel.Size = new System.Drawing.Size(expandedWidth - 90, 20);
             expandedCamera.FpsLabel.Visible = true;
-            
+
+            // Group indicator label
+            if (expandedCamera.GroupIndicatorLabel == null)
+            {
+                expandedCamera.GroupIndicatorLabel = new Label
+                {
+                    Size = new System.Drawing.Size(14, 14),
+                    BorderStyle = BorderStyle.FixedSingle,
+                };
+                this.Controls.Add(expandedCamera.GroupIndicatorLabel);
+            }
+            expandedCamera.GroupIndicatorLabel.Location = new System.Drawing.Point(
+                xPosition + Math.Min(expandedWidth, 400) - 20, yPosition + 4);
+            expandedCamera.GroupIndicatorLabel.BackColor = string.IsNullOrEmpty(expandedCamera.GroupId)
+                ? System.Drawing.Color.Gainsboro
+                : GroupColors.GetValueOrDefault(expandedCamera.GroupId, System.Drawing.Color.Gray);
+            expandedCamera.GroupIndicatorLabel.Visible = true;
+            expandedCamera.GroupIndicatorLabel.BringToFront();
+
             // Suspend form layout to prevent intermediate redraws
             this.SuspendLayout();
-            
-            // Set size and location before making visible
-            expandedCamera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 75);
-            expandedCamera.ImagingControl.Size = new System.Drawing.Size(expandedWidth, expandedHeight);
-            
-            // Ensure LiveDisplay is enabled (required for proper rendering)
-            expandedCamera.ImagingControl.LiveDisplay = true;
-            
-            // CRITICAL: Set LiveDisplayDefault to false to allow custom sizing
-            // Then set LiveDisplayWidth and LiveDisplayHeight to match the control size
-            // This is especially important for Y800 format cameras which don't auto-resize
-            expandedCamera.ImagingControl.LiveDisplayDefault = false;
-            expandedCamera.ImagingControl.LiveDisplayWidth = expandedWidth;
-            expandedCamera.ImagingControl.LiveDisplayHeight = expandedHeight;
-            
-            expandedCamera.ImagingControl.Visible = true;
-            expandedCamera.ImagingControl.BringToFront();
+
+            if (!expandedCamera.IsImagingSource && expandedCamera.WebcamPreview != null)
+            {
+                expandedCamera.WebcamPreview.Location = new System.Drawing.Point(xPosition, yPosition + 75);
+                expandedCamera.WebcamPreview.Size = new System.Drawing.Size(expandedWidth, expandedHeight);
+                expandedCamera.WebcamPreview.Visible = true;
+                expandedCamera.WebcamPreview.BringToFront();
+            }
+            else
+            {
+                // Set size and location before making visible
+                expandedCamera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 75);
+                expandedCamera.ImagingControl.Size = new System.Drawing.Size(expandedWidth, expandedHeight);
+
+                // Ensure LiveDisplay is enabled (required for proper rendering)
+                expandedCamera.ImagingControl.LiveDisplay = true;
+
+                // CRITICAL: Set LiveDisplayDefault to false to allow custom sizing
+                // Then set LiveDisplayWidth and LiveDisplayHeight to match the control size
+                // This is especially important for Y800 format cameras which don't auto-resize
+                expandedCamera.ImagingControl.LiveDisplayDefault = false;
+                expandedCamera.ImagingControl.LiveDisplayWidth = expandedWidth;
+                expandedCamera.ImagingControl.LiveDisplayHeight = expandedHeight;
+
+                expandedCamera.ImagingControl.Visible = true;
+                expandedCamera.ImagingControl.BringToFront();
+            }
             
             // Resume form layout
             this.ResumeLayout(false);
             
             // Force the control to refresh and update its display
-            expandedCamera.ImagingControl.Invalidate(true);
-            expandedCamera.ImagingControl.Refresh();
-            expandedCamera.ImagingControl.Update();
+            if (!expandedCamera.IsImagingSource && expandedCamera.WebcamPreview != null)
+            {
+                expandedCamera.WebcamPreview.Invalidate();
+                expandedCamera.WebcamPreview.Update();
+            }
+            else
+            {
+                expandedCamera.ImagingControl.Invalidate(true);
+                expandedCamera.ImagingControl.Refresh();
+                expandedCamera.ImagingControl.Update();
+            }
             
             // Force a layout update to ensure proper rendering
             this.PerformLayout();
@@ -5084,22 +6056,54 @@ namespace QueenPix
                 
                 camera.SettingsButton.Location = new System.Drawing.Point(xPosition + currentPreviewWidth - 80, yPosition + 42);
                 camera.SettingsButton.Visible = true;
+                camera.SettingsButton.BringToFront();
+                
+                camera.TriggerButton.Location = new System.Drawing.Point(xPosition + currentPreviewWidth - 160, yPosition + 42);
+                camera.TriggerButton.Visible = true;
+                camera.TriggerButton.BringToFront();
                 
                 camera.FpsLabel.Location = new System.Drawing.Point(xPosition, yPosition + 45);
                 camera.FpsLabel.Size = new System.Drawing.Size(currentPreviewWidth, 20);
                 camera.FpsLabel.Visible = true;
-                
-                camera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 68);
-                camera.ImagingControl.Size = new System.Drawing.Size(currentPreviewWidth, currentPreviewHeight);
-                
-                // CRITICAL: Set LiveDisplayDefault to false to allow custom sizing
-                // Then set LiveDisplayWidth and LiveDisplayHeight to match the control size
-                // This ensures the full camera view is scaled to fit, not just showing top-left corner
-                camera.ImagingControl.LiveDisplayDefault = false;
-                camera.ImagingControl.LiveDisplayWidth = currentPreviewWidth;
-                camera.ImagingControl.LiveDisplayHeight = currentPreviewHeight;
-                
-                camera.ImagingControl.Visible = true;
+
+                // Group indicator label (small colored square)
+                if (camera.GroupIndicatorLabel == null)
+                {
+                    camera.GroupIndicatorLabel = new Label
+                    {
+                        Size = new System.Drawing.Size(14, 14),
+                        BorderStyle = BorderStyle.FixedSingle,
+                    };
+                    this.Controls.Add(camera.GroupIndicatorLabel);
+                }
+                camera.GroupIndicatorLabel.Location = new System.Drawing.Point(
+                    xPosition + currentPreviewWidth - 20, yPosition + 4);
+                camera.GroupIndicatorLabel.BackColor = string.IsNullOrEmpty(camera.GroupId)
+                    ? System.Drawing.Color.Gainsboro
+                    : GroupColors.GetValueOrDefault(camera.GroupId, System.Drawing.Color.Gray);
+                camera.GroupIndicatorLabel.Visible = true;
+                camera.GroupIndicatorLabel.BringToFront();
+
+                if (!camera.IsImagingSource && camera.WebcamPreview != null)
+                {
+                    camera.WebcamPreview.Location = new System.Drawing.Point(xPosition, yPosition + 68);
+                    camera.WebcamPreview.Size = new System.Drawing.Size(currentPreviewWidth, currentPreviewHeight);
+                    camera.WebcamPreview.Visible = true;
+                }
+                else
+                {
+                    camera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 68);
+                    camera.ImagingControl.Size = new System.Drawing.Size(currentPreviewWidth, currentPreviewHeight);
+
+                    // CRITICAL: Set LiveDisplayDefault to false to allow custom sizing
+                    // Then set LiveDisplayWidth and LiveDisplayHeight to match the control size
+                    // This ensures the full camera view is scaled to fit, not just showing top-left corner
+                    camera.ImagingControl.LiveDisplayDefault = false;
+                    camera.ImagingControl.LiveDisplayWidth = currentPreviewWidth;
+                    camera.ImagingControl.LiveDisplayHeight = currentPreviewHeight;
+
+                    camera.ImagingControl.Visible = true;
+                }
             }
             
             // Adjust form size to fit all cameras
@@ -5192,19 +6196,35 @@ namespace QueenPix
                     var camera = cameras[i];
                     try
                     {
-                        // Always set up a FrameHandlerSink for live preview to enable screenshots
-                        // Store the original sink (might be null) before setting up preview sink
-                        camera.OriginalSink = camera.ImagingControl.Sink;
-                        
-                        // Create a FrameHandlerSink for live preview (same as timelapse)
-                        var previewSink = new FrameHandlerSink();
-                        previewSink.SnapMode = false; // Grab mode (continuous)
-                        camera.ImagingControl.Sink = previewSink;
-                        
-                        // Now start live
-                        camera.ImagingControl.LiveStart();
-                        camera.LastFpsUpdate = DateTime.Now;
-                        camera.FrameCount = 0;
+                        if (camera.IsImagingSource)
+                        {
+                            // Always set up a FrameHandlerSink for live preview to enable screenshots
+                            // Store the original sink (might be null) before setting up preview sink
+                            camera.OriginalSink = camera.ImagingControl.Sink;
+
+                            // Create a FrameHandlerSink for live preview (same as timelapse)
+                            var previewSink = new FrameHandlerSink();
+                            previewSink.SnapMode = false; // Grab mode (continuous)
+                            camera.ImagingControl.Sink = previewSink;
+
+                            // Now start live
+                            camera.ImagingControl.LiveStart();
+                            camera.LastFpsUpdate = DateTime.Now;
+                            camera.FrameCount = 0;
+                        }
+                        else
+                        {
+                            // Webcam path — OpenCV capture + background thread
+                            camera.WebcamCts = new CancellationTokenSource();
+                            camera.WebcamCapture = new VideoCapture(camera.WebcamDeviceIndex, (VideoCaptureAPIs)700);
+                            camera.WebcamCapture.Set(VideoCaptureProperties.FrameWidth, camera.WebcamResolution.Width);
+                            camera.WebcamCapture.Set(VideoCaptureProperties.FrameHeight, camera.WebcamResolution.Height);
+                            camera.LastFpsUpdate = DateTime.Now;
+                            camera.WebcamFrameCount = 0;
+                            camera.WebcamThread = new Thread(() => RunWebcamCaptureLoop(camera));
+                            camera.WebcamThread.IsBackground = true;
+                            camera.WebcamThread.Start();
+                        }
                         successCount++;
                     }
                     catch (Exception ex)
@@ -5238,33 +6258,41 @@ namespace QueenPix
             {
                 if (isRecording)
                 {
-                    StopRecording();
+                    StopRecording(null); // null = stop all cameras (Stop Live)
                 }
 
                 foreach (var camera in cameras)
                 {
                     try
                     {
-                        camera.ImagingControl.LiveStop();
-                        
-                        // Restore original sink (might be null) and dispose preview sink
-                        // Only dispose if it's not the same as OriginalSink (which might be needed for recording)
-                        var currentSink = camera.ImagingControl.Sink;
-                        if (currentSink is FrameHandlerSink previewSink && 
-                            camera.OriginalSink != previewSink)
+                        if (camera.IsImagingSource)
                         {
-                            // This was a preview sink that's not stored in OriginalSink, safe to dispose
-                            previewSink.Dispose();
+                            camera.ImagingControl.LiveStop();
+
+                            // Restore original sink (might be null) and dispose preview sink
+                            var currentSink = camera.ImagingControl.Sink;
+                            if (currentSink is FrameHandlerSink previewSink &&
+                                camera.OriginalSink != previewSink)
+                            {
+                                previewSink.Dispose();
+                            }
+
+                            camera.ImagingControl.Sink = camera.OriginalSink;
+
+                            if (!isRecording)
+                                camera.OriginalSink = null;
                         }
-                        
-                        // Restore original sink (might be null, or might be the preview sink if recording was active)
-                        camera.ImagingControl.Sink = camera.OriginalSink;
-                        
-                        // Only clear OriginalSink if we're not in recording mode
-                        // (During recording, OriginalSink holds the preview sink for screenshots)
-                        if (!isRecording)
+                        else
                         {
-                            camera.OriginalSink = null;
+                            // Webcam stop
+                            camera.WebcamCts?.Cancel();
+                            camera.WebcamThread?.Join(2000);
+                            camera.WebcamCapture?.Dispose();
+                            camera.WebcamCapture = null;
+                            camera.WebcamLastFrame?.Dispose();
+                            camera.WebcamLastFrame = null;
+                            if (camera.WebcamPreview != null)
+                                camera.WebcamPreview.Image = null;
                         }
                     }
                     catch { }
@@ -5281,6 +6309,63 @@ namespace QueenPix
             {
                 MessageBox.Show($"Error stopping cameras: {ex.Message}",
                                 "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        /// <summary>
+        /// Background thread that drives webcam preview, FPS counting, and recording.
+        /// </summary>
+        private void RunWebcamCaptureLoop(CameraControl camera)
+        {
+            using var frame = new Mat();
+            while (camera.WebcamCts != null && !camera.WebcamCts.Token.IsCancellationRequested)
+            {
+                if (camera.WebcamCapture == null || !camera.WebcamCapture.Read(frame) || frame.Empty())
+                {
+                    Thread.Sleep(10);
+                    continue;
+                }
+
+                camera.WebcamFrameCount++;
+
+                // Store last frame for timelapse
+                lock (camera.WebcamFrameLock)
+                {
+                    camera.WebcamLastFrame?.Dispose();
+                    camera.WebcamLastFrame = frame.Clone();
+                }
+
+                // Write to file if normal recording
+                if (IsCameraRecording(camera) && !camera.IsTimelapseMode && camera.WebcamWriter != null)
+                {
+                    lock (camera.WebcamFrameLock)
+                    {
+                        // Re-check inside lock: StopRecording may have disposed the writer
+                        // while we were waiting for the lock
+                        camera.WebcamWriter?.Write(frame);
+                    }
+                }
+
+                // Update preview PictureBox (throttled to ~30 FPS)
+                bool shouldUpdatePreview = (DateTime.UtcNow - camera.WebcamLastPreviewTime).TotalMilliseconds >= 33;
+                if (shouldUpdatePreview && camera.WebcamPreview != null && camera.WebcamPreview.IsHandleCreated)
+                {
+                    camera.WebcamLastPreviewTime = DateTime.UtcNow;
+                    try
+                    {
+                        var bmp = BitmapConverter.ToBitmap(frame);
+                        if (camera.Settings.ShowDate || camera.Settings.ShowTime)
+                            bmp = ApplyDateTimeOverlay(bmp, camera.Settings);
+                        camera.WebcamPreview.BeginInvoke(() =>
+                        {
+                            if (camera.WebcamPreview.IsDisposed) { bmp.Dispose(); return; }
+                            var old = camera.WebcamPreview.Image;
+                            camera.WebcamPreview.Image = bmp;
+                            old?.Dispose();
+                        });
+                    }
+                    catch { }
+                }
             }
         }
 
@@ -5461,7 +6546,10 @@ namespace QueenPix
                 }
 
                 cmbRecordingMode.Enabled = false;
-                
+
+                // Determine target cameras (group subset or all)
+                var targets = (IReadOnlyList<CameraControl>)(_recordingFilter ?? cameras);
+
                 int successCount = 0;
                 List<string> errors = new List<string>();
 
@@ -5473,7 +6561,7 @@ namespace QueenPix
                 // Check recording mode
                 string recordingMode = cmbRecordingMode.SelectedItem?.ToString() ?? "Normal Recording";
                 bool isLoopMode = recordingMode == "Loop Recording";
-                bool isTimelapseMode = recordingMode == "Timelapse";
+                isTimelapseMode = recordingMode == "Timelapse"; // set class-level field for webcam loop
                 int loopDurationSeconds = (int)numLoopDuration.Value;
 
                 if (isLoopMode)
@@ -5497,12 +6585,13 @@ namespace QueenPix
                     
                     LogCameraInfo($"Timelapse mode ENABLED - frame every {intervalSeconds}s");
                 }
-                // PHASE 1: Stop all cameras first (synchronized)
-                foreach (var camera in cameras)
+                // PHASE 1: Stop target cameras first (synchronized); webcams stay running
+                foreach (var camera in targets)
                 {
                     try
                     {
-                        camera.ImagingControl.LiveStop();
+                        if (camera.IsImagingSource)
+                            camera.ImagingControl.LiveStop();
                         camera.TotalRecordedFrames = 0;
                         camera.FrameCount = 0;
 
@@ -5554,12 +6643,45 @@ namespace QueenPix
 
                 System.Threading.Thread.Sleep(50);
 
-                // PHASE 2: Configure sinks for all cameras
-                for (int i = 0; i < cameras.Count; i++)
+                // PHASE 2: Configure sinks for target cameras
+                for (int i = 0; i < targets.Count; i++)
                 {
-                    var camera = cameras[i];
+                    var camera = targets[i];
                     try
                     {
+                        if (!camera.IsImagingSource)
+                        {
+                            // Webcam — no sink to configure; only set up WebcamWriter for normal recording
+                            if (!isTimelapseMode && !isLoopMode)
+                            {
+                                string safeName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
+                                if (string.IsNullOrWhiteSpace(safeName)) safeName = $"Camera{i + 1}";
+                                string aviPath = Path.Combine(workingFolder, $"{currentRecordingBaseName}_{safeName}.avi");
+                                camera.RecordingFilePath = aviPath;
+                                int w = camera.WebcamCapture != null
+                                    ? (int)camera.WebcamCapture.Get(VideoCaptureProperties.FrameWidth)
+                                    : camera.WebcamResolution.Width;
+                                int h = camera.WebcamCapture != null
+                                    ? (int)camera.WebcamCapture.Get(VideoCaptureProperties.FrameHeight)
+                                    : camera.WebcamResolution.Height;
+                                camera.WebcamWriter = new VideoWriter(aviPath, FourCC.MJPG, 30.0, new OpenCvSharp.Size(w, h));
+                                LogCameraInfo($"Webcam {camera.CustomName}: recording to {aviPath}");
+                            }
+                            else if (isTimelapseMode)
+                            {
+                                // Timelapse folder already created in PHASE 1 (camera.IsTimelapseMode set);
+                                // RunWebcamCaptureLoop keeps WebcamLastFrame updated; timer saves it.
+                                string timelapseMainFolder = Path.Combine(workingFolder, $"Timelapse_Frames_{currentRecordingBaseName}");
+                                string camName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
+                                string camFolder = Path.Combine(timelapseMainFolder, camName);
+                                Directory.CreateDirectory(camFolder);
+                                camera.TimelapseImagePaths ??= new List<string>();
+                                LogCameraInfo($"Webcam {camera.CustomName}: timelapse folder {camFolder}");
+                            }
+                            successCount++;
+                            continue;
+                        }
+
                         camera.OriginalSink = camera.ImagingControl.Sink;
 
                         if (isLoopMode)
@@ -5716,15 +6838,18 @@ namespace QueenPix
                     }
                 }
 
-                // PHASE 3: Start all cameras (simple now - polling handles frame capture)
-                for (int i = 0; i < cameras.Count; i++)
+                // PHASE 3: Start target cameras (webcams stay running; only TIS cameras need LiveStart)
+                for (int i = 0; i < targets.Count; i++)
                 {
-                    var camera = cameras[i];
-                    
+                    var camera = targets[i];
                     try
                     {
-                        camera.ImagingControl.LiveStart();
-                        System.Threading.Thread.Sleep(10);
+                        if (camera.IsImagingSource)
+                        {
+                            camera.ImagingControl.LiveStart();
+                            System.Threading.Thread.Sleep(10);
+                        }
+                        // Webcams: already running via RunWebcamCaptureLoop; just mark start time
                         camera.RecordingStartTime = DateTime.Now;
                         successCount++;
                         LogCameraInfo($"Camera {i + 1} started at {camera.RecordingStartTime.Value:HH:mm:ss.fff}");
@@ -5742,27 +6867,58 @@ namespace QueenPix
                     btnStopRecording.Enabled = true;
                     btnScreenshot.Enabled = true;
 
-                    // Start timelapse capture timer if in timelapse mode
+                    // Track group recording state
+                    string activeGroupId = _recordingFilter?[0]?.GroupId ?? "";
+                    _groupRecording[activeGroupId] = true;
+                    _groupRecordingBaseName[activeGroupId] = currentRecordingBaseName;
+                    _groupRecordingMode[activeGroupId] = recordingMode;
+                    // Store the EXACT cameras being recorded for this group — used at stop time
+                    _groupCameras[activeGroupId] = new List<CameraControl>(targets);
+                    _recordingFilter = null;   // always reset after use
+                    LogCameraInfo($"Group '{activeGroupId}' recording started with {_groupCameras[activeGroupId].Count} cameras: {string.Join(", ", _groupCameras[activeGroupId].Select(c => c.CustomName))}");
+                    UpdateGroupButtonRow();
+
+                    // Start per-group timelapse capture timer if in timelapse mode
                     if (isTimelapseMode)
                     {
-                        timelapseTimer = new System.Windows.Forms.Timer();
-                        timelapseTimer.Interval = 100;
-                        
-                        timelapseTimer.Tick += (s, e) =>
+                        string capturedBaseName = currentRecordingBaseName;
+                        string capturedGroupId = activeGroupId;
+                        // Snapshot the group's cameras so this timer only touches them
+                        var capturedCameras = new List<CameraControl>(_groupCameras[capturedGroupId]);
+
+                        // Stop any previous timer for this group (shouldn't exist, but be safe)
+                        if (_timelapsTimers.TryGetValue(capturedGroupId, out var oldTimer))
                         {
-                            if (!isRecording)
+                            oldTimer.Stop();
+                            oldTimer.Dispose();
+                            _timelapsTimers.Remove(capturedGroupId);
+                        }
+
+                        var timer = new System.Windows.Forms.Timer { Interval = 100 };
+                        _timelapsTimers[capturedGroupId] = timer;
+
+                        timer.Tick += (s, e) =>
+                        {
+                            // Guard: timer may fire once after Dispose
+                            if (!_timelapsTimers.ContainsKey(capturedGroupId)) return;
+                            // Stop if this group is no longer recording
+                            if (!_groupRecording.GetValueOrDefault(capturedGroupId))
                             {
-                                timelapseTimer.Stop();
-                                timelapseTimer.Dispose();
+                                if (_timelapsTimers.TryGetValue(capturedGroupId, out var t))
+                                {
+                                    _timelapsTimers.Remove(capturedGroupId);
+                                    t.Stop();
+                                    t.Dispose();
+                                }
                                 return;
                             }
-                            
+
                             DateTime now = DateTime.Now;
-                            
-                            foreach (var camera in cameras)
+
+                            foreach (var camera in capturedCameras)
                             {
                                 if (!camera.IsTimelapseMode) continue;
-                                
+
                                 // Check if it's time to capture
                                 bool shouldCapture = false;
                                 if (camera.LastTimelapseCapture == null)
@@ -5773,57 +6929,65 @@ namespace QueenPix
                                 {
                                     double elapsed = (now - camera.LastTimelapseCapture.Value).TotalSeconds;
                                     if (elapsed >= camera.TimelapseIntervalSeconds)
-                                    {
                                         shouldCapture = true;
-                                    }
                                 }
-                                
+
                                 if (shouldCapture)
                                 {
                                     try
                                     {
-                                        if (camera.ImagingControl.Sink is FrameHandlerSink tlSink)
+                                        System.Drawing.Bitmap? tlBitmap = null;
+
+                                        if (camera.IsImagingSource)
                                         {
-                                            var imageBuffer = tlSink.LastAcquiredBuffer;
-                                            if (imageBuffer != null)
+                                            if (camera.ImagingControl.Sink is FrameHandlerSink tlSink)
                                             {
-                                                var bitmap = imageBuffer.CreateBitmapWrap();
-                                                using (System.Drawing.Bitmap clone = new System.Drawing.Bitmap(bitmap))
+                                                var imageBuffer = tlSink.LastAcquiredBuffer;
+                                                if (imageBuffer != null)
+                                                    tlBitmap = new System.Drawing.Bitmap(imageBuffer.CreateBitmapWrap());
+                                            }
+                                        }
+                                        else
+                                        {
+                                            lock (camera.WebcamFrameLock)
+                                            {
+                                                if (camera.WebcamLastFrame != null)
+                                                    tlBitmap = BitmapConverter.ToBitmap(camera.WebcamLastFrame);
+                                            }
+                                        }
+
+                                        if (tlBitmap != null)
+                                        {
+                                            using (var clone = tlBitmap)
+                                            {
+                                                string cameraName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
+                                                string timelapseMainFolder = Path.Combine(workingFolder, $"Timelapse_Frames_{capturedBaseName}");
+                                                string cameraFolder = Path.Combine(timelapseMainFolder, cameraName);
+                                                string frameNumber = camera.TimelapseFrameCount.ToString("D6");
+                                                string imagePath = Path.Combine(cameraFolder, $"{capturedBaseName}_{cameraName}_{frameNumber}.png");
+
+                                                System.Drawing.Bitmap finalBitmap = clone;
+                                                bool overlayApplied = false;
+                                                if (camera.Settings.ShowDate || camera.Settings.ShowTime)
                                                 {
-                                                    string cameraName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
-                                                    string timelapseMainFolder = Path.Combine(workingFolder, $"Timelapse_Frames_{currentRecordingBaseName}");
-                                                    string cameraFolder = Path.Combine(timelapseMainFolder, cameraName);
-                                                    string frameNumber = camera.TimelapseFrameCount.ToString("D6");
-                                                    string imagePath = Path.Combine(cameraFolder, $"{currentRecordingBaseName}_{cameraName}_{frameNumber}.png");
-                                                    
-                                                    // Apply date/time overlay if enabled
-                                                    System.Drawing.Bitmap finalBitmap = clone;
-                                                    bool overlayApplied = false;
-                                                    if (camera.Settings.ShowDate || camera.Settings.ShowTime)
-                                                    {
-                                                        finalBitmap = ApplyDateTimeOverlay(clone, camera.Settings, now);
-                                                        overlayApplied = true;
-                                                    }
-                                                    
-                                                    try
-                                                    {
-                                                        finalBitmap.Save(imagePath, System.Drawing.Imaging.ImageFormat.Png);
-                                                    }
-                                                    finally
-                                                    {
-                                                        // Dispose overlay bitmap if it was created
-                                                        if (overlayApplied && finalBitmap != clone)
-                                                        {
-                                                            finalBitmap.Dispose();
-                                                        }
-                                                    }
-                                                    
-                                                    camera.TimelapseImagePaths!.Add(imagePath);
-                                                    camera.TimelapseFrameCount++;
-                                                    camera.LastTimelapseCapture = now;
-                                                    
-                                                    LogCameraInfo($"{camera.CustomName}: Captured timelapse frame {camera.TimelapseFrameCount}");
+                                                    finalBitmap = ApplyDateTimeOverlay(clone, camera.Settings, now);
+                                                    overlayApplied = true;
                                                 }
+
+                                                try
+                                                {
+                                                    finalBitmap.Save(imagePath, System.Drawing.Imaging.ImageFormat.Png);
+                                                }
+                                                finally
+                                                {
+                                                    if (overlayApplied && finalBitmap != clone)
+                                                        finalBitmap.Dispose();
+                                                }
+
+                                                camera.TimelapseImagePaths!.Add(imagePath);
+                                                camera.TimelapseFrameCount++;
+                                                camera.LastTimelapseCapture = now;
+                                                LogCameraInfo($"{camera.CustomName}: Captured timelapse frame {camera.TimelapseFrameCount}");
                                             }
                                         }
                                     }
@@ -5834,9 +6998,9 @@ namespace QueenPix
                                 }
                             }
                         };
-                        
-                        timelapseTimer.Start();
-                        LogCameraInfo("Timelapse capture timer started");
+
+                        timer.Start();
+                        LogCameraInfo($"Timelapse capture timer started for group '{capturedGroupId}'");
                     }
 
                     // Check max duration from settings
@@ -5864,31 +7028,33 @@ namespace QueenPix
                         
                         DateTime recordingStart = DateTime.Now;
                         
+                        string activeGidForTimer = activeGroupId;
                         System.Windows.Forms.Timer maxDurationTimer = new System.Windows.Forms.Timer();
                         maxDurationTimer.Interval = 10000; // Check every 10 seconds
                         maxDurationTimer.Tick += (s, e) =>
                         {
-                            if (!isRecording)
+                            if (!_groupRecording.GetValueOrDefault(activeGidForTimer))
                             {
                                 maxDurationTimer.Stop();
                                 maxDurationTimer.Dispose();
                                 return;
                             }
-                            
+
                             double elapsedMinutes = (DateTime.Now - recordingStart).TotalMinutes;
                             if (elapsedMinutes >= maxMinutes)
                             {
                                 maxDurationTimer.Stop();
                                 LogCameraInfo($"Max duration reached ({durationDisplay}) - stopping recording automatically");
-                                
-                                // Auto-stop recording
+
+                                // Auto-stop recording for this specific group
                                 this.Invoke(new Action(() =>
                                 {
-                                    BtnStopRecording_Click(null, EventArgs.Empty);
+                                    btnScreenshot.Enabled = btnStopLive.Enabled;
+                                    StopRecording(activeGidForTimer);
                                     MessageBox.Show($"Recording automatically stopped after {durationDisplay}.",
                                                     "Max Duration Reached", MessageBoxButtons.OK, MessageBoxIcon.Information);
                                 }));
-                                
+
                                 maxDurationTimer.Dispose();
                             }
                         };
@@ -5917,7 +7083,7 @@ namespace QueenPix
         private void BtnStopRecording_Click(object? sender, EventArgs e)
         {
             btnScreenshot.Enabled = btnStopLive.Enabled;
-            StopRecording();
+            StopRecording(""); // "" = stop only unassigned cameras (group cameras unaffected)
         }
 
         /// <summary>
@@ -6115,38 +7281,69 @@ namespace QueenPix
             return 0;
         }
 
-        private void StopRecording()
+        // groupId: null = stop ALL cameras (Stop Live / disk-full emergency)
+        //          ""   = stop only unassigned cameras (global Stop Recording button)
+        //          "A"  = stop only Group A cameras (group-specific stop)
+        private void StopRecording(string? groupId = null)
         {
             try
             {
                 if (isRecording)
                 {
-                    LogCameraInfo("=== RECORDING STOP REQUESTED ===");
-                    
-                    // Re-enable recording mode controls
-                    cmbRecordingMode.Enabled = true;
+                    LogCameraInfo($"=== RECORDING STOP REQUESTED (groupId='{groupId ?? "ALL"}') ===");
 
-                    string recordingMode = cmbRecordingMode.SelectedItem?.ToString() ?? "Normal Recording";
-                    bool isLoopMode = recordingMode == "Loop Recording";
-                    bool isTimelapseMode = recordingMode == "Timelapse";
-                    
+                    // Determine target cameras
+                    bool stopAll = groupId == null;
+                    string activeGroupId = groupId ?? "";
+                    IReadOnlyList<CameraControl> targets;
+                    if (stopAll)
+                    {
+                        targets = cameras;
+                    }
+                    else if (_groupCameras.TryGetValue(activeGroupId, out var storedCams) && storedCams.Count > 0)
+                    {
+                        // Use the EXACT cameras that were stored when recording started for this group
+                        targets = storedCams;
+                    }
+                    else
+                    {
+                        // Fallback: filter by GroupId (should not normally be needed)
+                        targets = cameras.Where(c => c.GroupId == activeGroupId).ToList();
+                    }
+
+                    LogCameraInfo($"StopRecording: groupId='{activeGroupId}', stopAll={stopAll}, targets={targets.Count}: {string.Join(", ", targets.Select(c => c.CustomName))}");
+
+                    // Guard: nothing to stop
+                    if (targets.Count == 0)
+                    {
+                        LogCameraInfo($"StopRecording: no cameras found for groupId='{activeGroupId}', returning");
+                        return;
+                    }
+
+                    // Determine mode from what was used when this group started recording
+                    string recordingMode = _groupRecordingMode.GetValueOrDefault(
+                        activeGroupId, cmbRecordingMode.SelectedItem?.ToString() ?? "Normal Recording");
+                    bool isGroupLoopMode = recordingMode == "Loop Recording";
+                    bool isGroupTimelapse = recordingMode == "Timelapse";
+
                     int successCount = 0;
                     List<string> aviFiles = new List<string>();
                     List<(string filename, int frames, double duration)> frameStats = new List<(string, int, double)>();
                     List<long> aviFileSizes = new List<long>();
 
-                    if (isTimelapseMode)
+                    if (isGroupTimelapse)
                     {
                         // TIMELAPSE MODE: Compile images to video
                         LogCameraInfo("Timelapse mode - stopping and compiling videos");
-                        
-                        // Stop cameras
-                        foreach (var camera in cameras)
+
+                        // Stop target cameras
+                        foreach (var camera in targets)
                         {
                             try
                             {
                                 camera.RecordingStopTime = DateTime.Now;
-                                camera.ImagingControl.LiveStop();
+                                if (camera.IsImagingSource)
+                                    camera.ImagingControl.LiveStop();
                                 LogCameraInfo($"{camera.CustomName}: Stopped - captured {camera.TimelapseFrameCount} frames");
                             }
                             catch (Exception ex)
@@ -6154,41 +7351,69 @@ namespace QueenPix
                                 LogCameraInfo($"{camera.CustomName}: Error stopping - {ex.Message}");
                             }
                         }
-                        
-                        // Stop timelapse timer - store reference at class level instead
-                        if (timelapseTimer != null)
+
+                        // Stop this group's timelapse timer only
+                        if (stopAll)
                         {
-                            timelapseTimer.Stop();
-                            timelapseTimer.Dispose();
-                            timelapseTimer = null;
+                            foreach (var kvp in _timelapsTimers.ToList())
+                            {
+                                _timelapsTimers.Remove(kvp.Key);
+                                kvp.Value.Stop();
+                                kvp.Value.Dispose();
+                            }
                         }
-                        
-                        // Restart cameras in live mode
-                        foreach (var camera in cameras)
+                        else if (_timelapsTimers.TryGetValue(activeGroupId, out var tTimer))
+                        {
+                            _timelapsTimers.Remove(activeGroupId); // remove before Stop to prevent Tick re-entry
+                            tTimer.Stop();
+                            tTimer.Dispose();
+                        }
+
+                        // Restart TIS cameras in live mode; webcams keep running
+                        foreach (var camera in targets)
                         {
                             try
                             {
-                                camera.ImagingControl.Sink = camera.OriginalSink;
-                                camera.ImagingControl.LiveStart();
+                                if (camera.IsImagingSource)
+                                {
+                                    camera.ImagingControl.Sink = camera.OriginalSink;
+                                    camera.ImagingControl.LiveStart();
+                                }
                             }
                             catch { }
                         }
-                        
-                        // Show timelapse compilation dialog
-                        ShowTimelapseCompilationDialog();
+                        if (stopAll)
+                        {
+                            foreach (var key in _groupRecording.Keys.ToList()) _groupRecording[key] = false;
+                            _groupCameras.Clear();
+                        }
+                        else
+                        {
+                            _groupRecording[activeGroupId] = false;
+                            _groupCameras.Remove(activeGroupId);
+                        }
+                        isRecording = _groupRecording.Values.Any(v => v);
+                        if (!isRecording) cmbRecordingMode.Enabled = true;
+                        UpdateGroupButtonRow();
+                        btnStopRecording.Enabled = _groupRecording.GetValueOrDefault("");
+
+                        // Show timelapse compilation dialog for this group's cameras only
+                        ShowTimelapseCompilationDialog(targets);
+                        return;
                     }
-                    else if (isLoopMode)
+                    else if (isGroupLoopMode)
                     {
                         // LOOP MODE: CRITICAL - Stop cameras FIRST to freeze the buffer!
                         LogCameraInfo("Loop mode - stopping cameras immediately to freeze buffer");
-                        
-                        // STEP 1: Stop all cameras IMMEDIATELY (before touching threads or buffers)
-                        foreach (var camera in cameras)
+
+                        // STEP 1: Stop target TIS cameras IMMEDIATELY (webcams don't use loop mode)
+                        foreach (var camera in targets)
                         {
                             try
                             {
                                 camera.RecordingStopTime = DateTime.Now;
-                                camera.ImagingControl.LiveStop();
+                                if (camera.IsImagingSource)
+                                    camera.ImagingControl.LiveStop();
                                 LogCameraInfo($"{camera.CustomName}: Camera stopped at {camera.RecordingStopTime.Value:HH:mm:ss.fff}");
                             }
                             catch (Exception ex)
@@ -6196,13 +7421,13 @@ namespace QueenPix
                                 LogCameraInfo($"{camera.CustomName}: Error stopping camera - {ex.Message}");
                             }
                         }
-                        
+
                         // STEP 2: Give a tiny moment for any in-flight frames to finish processing
                         System.Threading.Thread.Sleep(100);
-                        
+
                         // STEP 3: Now stop the polling threads (they won't add any more frames)
                         LogCameraInfo("Loop mode - stopping polling threads");
-                        foreach (var camera in cameras)
+                        foreach (var camera in targets)
                         {
                             if (camera.LoopCancelToken != null)
                             {
@@ -6224,9 +7449,9 @@ namespace QueenPix
                         string tempFolder = Path.Combine(Path.GetTempPath(), $"LoopRecording_{DateTime.Now:yyyyMMddHHmmss}");
                         Directory.CreateDirectory(tempFolder);
                         
-                        for (int i = 0; i < cameras.Count; i++)
+                        for (int i = 0; i < targets.Count; i++)
                         {
-                            var camera = cameras[i];
+                            var camera = targets[i];
                             try
                             {
                                 // Save loop buffer to AVI file
@@ -6288,9 +7513,12 @@ namespace QueenPix
                                     }
                                 }
                                 
-                                // Restore original sink and restart live
-                                camera.ImagingControl.Sink = camera.OriginalSink;
-                                camera.ImagingControl.LiveStart();
+                                // Restore original sink and restart live (TIS only)
+                                if (camera.IsImagingSource)
+                                {
+                                    camera.ImagingControl.Sink = camera.OriginalSink;
+                                    camera.ImagingControl.LiveStart();
+                                }
                                 
                                 successCount++;
                             }
@@ -6302,25 +7530,38 @@ namespace QueenPix
                     }
                     else
                     {
-                        // NORMAL MODE: Stop cameras and capture individual stop times
-                        for (int i = 0; i < cameras.Count; i++)
+                        // NORMAL MODE: Stop target cameras and capture individual stop times
+                        for (int i = 0; i < targets.Count; i++)
                         {
-                            var camera = cameras[i];
+                            var camera = targets[i];
                             try
                             {
                                 System.Threading.Thread.Sleep(10);
                                 camera.RecordingStopTime = DateTime.Now;
                                 LogCameraInfo($"Camera {i + 1} stopping at {camera.RecordingStopTime.Value:HH:mm:ss.fff}");
-                                
-                                camera.ImagingControl.LiveStop();
-                                camera.ImagingControl.Sink = camera.OriginalSink;
-                                camera.ImagingControl.LiveStart();
-                                
+
+                                if (camera.IsImagingSource)
+                                {
+                                    camera.ImagingControl.LiveStop();
+                                    camera.ImagingControl.Sink = camera.OriginalSink;
+                                    camera.ImagingControl.LiveStart();
+                                }
+                                else
+                                {
+                                    // Webcam: stop writer under lock so RunWebcamCaptureLoop
+                                    // cannot be mid-write when we dispose (race → native crash)
+                                    lock (camera.WebcamFrameLock)
+                                    {
+                                        camera.WebcamWriter?.Dispose();
+                                        camera.WebcamWriter = null;
+                                    }
+                                }
+
                                 if (camera.RecordingFilePath != null)
                                 {
                                     aviFiles.Add(camera.RecordingFilePath);
                                 }
-                                
+
                                 successCount++;
                             }
                             catch (Exception ex)
@@ -6330,9 +7571,21 @@ namespace QueenPix
                         }
                     }
 
-                    isRecording = false;
-                    btnStartRecording.Enabled = true;
-                    btnStopRecording.Enabled = false;
+                    // Clear group recording state
+                    if (stopAll)
+                    {
+                        foreach (var key in _groupRecording.Keys.ToList()) _groupRecording[key] = false;
+                        _groupCameras.Clear();
+                    }
+                    else
+                    {
+                        _groupRecording[activeGroupId] = false;
+                        _groupCameras.Remove(activeGroupId);
+                    }
+                    isRecording = _groupRecording.Values.Any(v => v);
+                    if (!isRecording) cmbRecordingMode.Enabled = true;
+                    UpdateGroupButtonRow();
+                    btnStopRecording.Enabled = _groupRecording.GetValueOrDefault("");
 
                     // Give files a moment to finalize
                     System.Threading.Thread.Sleep(500);
@@ -6340,10 +7593,10 @@ namespace QueenPix
                     // Get frame counts and calculate durations (same for both modes)
 
                     // Get frame counts and calculate durations (same for both modes)
-                    for (int i = 0; i < aviFiles.Count && i < cameras.Count; i++)
+                    for (int i = 0; i < aviFiles.Count && i < targets.Count; i++)
                     {
                         string aviFile = aviFiles[i];
-                        var camera = cameras[i];
+                        var camera = targets[i];
                         
                         if (File.Exists(aviFile))
                         {
@@ -6354,7 +7607,7 @@ namespace QueenPix
                             int frameCount = 0;
                             double actualDuration = 0;
                             
-                            if (isLoopMode)
+                            if (isGroupLoopMode)
                             {
                                 // For loop mode, we know the frame count from the buffer
                                 // Try FFprobe first, but fall back to buffer count if it fails
@@ -6425,21 +7678,35 @@ namespace QueenPix
                         }
                     }
 
+                    // Remove files that have 0 frames (recording too short / empty AVI)
+                    for (int i = frameStats.Count - 1; i >= 0; i--)
+                    {
+                        if (frameStats[i].frames == 0)
+                        {
+                            LogCameraInfo($"Skipping empty file: {frameStats[i].filename}");
+                            try { if (File.Exists(aviFiles[i])) File.Delete(aviFiles[i]); } catch { }
+                            frameStats.RemoveAt(i);
+                            aviFiles.RemoveAt(i);
+                            aviFileSizes.RemoveAt(i);
+                        }
+                    }
+
                     // Check if we got any valid files
                     if (frameStats.Count == 0)
                     {
-                        MessageBox.Show("No valid video files were created. Recording may have failed.",
-                                        "Recording Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        MessageBox.Show("No valid video files were created. Recording may have been too short.",
+                                        "Recording Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         return;
                     }
 
                     // Show frame selection and save dialog (same as normal)
+                    string groupBaseName = _groupRecordingBaseName.GetValueOrDefault(activeGroupId, currentRecordingBaseName);
                     using (FrameSelectionDialog dialog = new FrameSelectionDialog(
-                        frameStats, 
+                        frameStats,
                         aviFileSizes,
                         aviFiles,
-                        txtWorkingFolder.Text, 
-                        currentRecordingBaseName))
+                        txtWorkingFolder.Text,
+                        groupBaseName))
                     {
                         if (dialog.ShowDialog() == DialogResult.OK)
                         {
@@ -6466,7 +7733,7 @@ namespace QueenPix
                             }
                             
                             // Delete temp folder if it exists
-                            if (isLoopMode)
+                            if (isGroupLoopMode)
                             {
                                 try
                                 {
@@ -7372,12 +8639,13 @@ namespace QueenPix
                             failCount > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
         }
 
-        private void ShowTimelapseCompilationDialog()
+        private void ShowTimelapseCompilationDialog(IReadOnlyList<CameraControl>? groupCameras = null)
         {
             try
             {
-                // Check if any cameras have captured frames
-                var camerasWithFrames = cameras.Where(c => c.TimelapseImagePaths != null && c.TimelapseImagePaths.Count > 0).ToList();
+                // Check if any cameras have captured frames (limited to this group's cameras if specified)
+                var searchCameras = groupCameras ?? cameras;
+                var camerasWithFrames = searchCameras.Where(c => c.TimelapseImagePaths != null && c.TimelapseImagePaths.Count > 0).ToList();
                 
                 if (camerasWithFrames.Count == 0)
                 {
@@ -7428,6 +8696,8 @@ namespace QueenPix
                 y += camerasWithFrames.Count * 20 + 20;
                 
                 // Output frame rate
+                int totalFrames = camerasWithFrames.Max(c => c.TimelapseFrameCount);
+
                 Label lblOutputFps = new Label
                 {
                     Text = "Output Video Frame Rate:",
@@ -7436,18 +8706,19 @@ namespace QueenPix
                     Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
                 };
                 compilationDialog.Controls.Add(lblOutputFps);
-                
+
                 NumericUpDown numOutputFps = new NumericUpDown
                 {
                     Location = new System.Drawing.Point(210, y - 2),
                     Size = new System.Drawing.Size(80, 25),
-                    Minimum = 1,
+                    Minimum = 0.1m,
                     Maximum = 120,
                     Value = 24,
-                    DecimalPlaces = 0
+                    DecimalPlaces = 1,
+                    Increment = 0.5m
                 };
                 compilationDialog.Controls.Add(numOutputFps);
-                
+
                 Label lblFpsUnit = new Label
                 {
                     Text = "fps",
@@ -7456,6 +8727,33 @@ namespace QueenPix
                     Font = new System.Drawing.Font("Arial", 9)
                 };
                 compilationDialog.Controls.Add(lblFpsUnit);
+
+                // Duration preview: updates live as fps changes
+                Label lblDurationPreview = new Label
+                {
+                    Text = "",
+                    Location = new System.Drawing.Point(335, y),
+                    Size = new System.Drawing.Size(180, 20),
+                    Font = new System.Drawing.Font("Arial", 8),
+                    ForeColor = System.Drawing.Color.Gray
+                };
+                compilationDialog.Controls.Add(lblDurationPreview);
+
+                Action updateDurationPreview = () =>
+                {
+                    double fps = (double)numOutputFps.Value;
+                    if (fps > 0)
+                    {
+                        double seconds = totalFrames / fps;
+                        string dur = seconds >= 60
+                            ? $"{(int)(seconds / 60)}m {seconds % 60:F0}s"
+                            : $"{seconds:F1}s";
+                        lblDurationPreview.Text = $"≈ {dur} video";
+                    }
+                };
+                numOutputFps.ValueChanged += (s2, e2) => updateDurationPreview();
+                updateDurationPreview();
+
                 y += 40;
                 
                 // Output format
@@ -7623,8 +8921,11 @@ namespace QueenPix
                 try
                 {
                     string cameraName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
-                    string timelapseFolder = Path.Combine(txtWorkingFolder.Text, $"Timelapse_{currentRecordingBaseName}_{cameraName}");
-                    
+                    // Derive folder from the actual saved frame paths (avoids hardcoded path mismatch)
+                    string timelapseFolder = camera.TimelapseImagePaths!.Count > 0
+                        ? Path.GetDirectoryName(camera.TimelapseImagePaths[0])!
+                        : Path.Combine(txtWorkingFolder.Text, $"Timelapse_Frames_{currentRecordingBaseName}", cameraName);
+
                     // Create file list for FFmpeg
                     string fileListPath = Path.Combine(timelapseFolder, "filelist.txt");
                     using (StreamWriter writer = new StreamWriter(fileListPath))
@@ -7728,9 +9029,21 @@ namespace QueenPix
                 progressBar.Value = i + 1;
                 Application.DoEvents();
             }
-            
+
             progressForm.Close();
-            
+
+            // Delete the now-empty parent timelapse folder (per-camera subfolders were already deleted above)
+            if (!keepImages)
+            {
+                try
+                {
+                    string parentFolder = Path.Combine(txtWorkingFolder.Text, $"Timelapse_Frames_{currentRecordingBaseName}");
+                    if (Directory.Exists(parentFolder) && !Directory.EnumerateFileSystemEntries(parentFolder).Any())
+                        Directory.Delete(parentFolder);
+                }
+                catch { }
+            }
+
             // Show results
             string resultMessage = "";
             if (successCount > 0)

@@ -21,7 +21,10 @@ namespace QueenPix
         public bool ShowMilliseconds { get; set; } = false;
         
         // JSON timestamp file generation
-        public bool GenerateJsonTimestamps { get; set; } = true; // Default to enabled 
+        public bool GenerateJsonTimestamps { get; set; } = true; // Default to enabled
+
+        // Camera type flag
+        public bool IsImagingSource { get; set; } = true;
         public CameraSettings()
         {
         }
@@ -46,7 +49,8 @@ namespace QueenPix
                 ShowDate = this.ShowDate,
                 ShowTime = this.ShowTime,
                 ShowMilliseconds = this.ShowMilliseconds,
-                GenerateJsonTimestamps = this.GenerateJsonTimestamps
+                GenerateJsonTimestamps = this.GenerateJsonTimestamps,
+                IsImagingSource = this.IsImagingSource
             };
         }
     }
