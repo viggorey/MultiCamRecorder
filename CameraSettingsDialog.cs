@@ -18,6 +18,11 @@ namespace QueenPix
         private Label? lblFpsRange;
         private RadioButton? rbExternalTrigger;
         private RadioButton? rbSoftwareControlled;
+        private Label? lblFrameRateHeader;
+        private Label? lblSoftwareFpsHeader;
+        private Label? lblTriggerNoteField;
+        private ComboBox? cmbWebcamFps;
+        private Label? lblWebcamFpsStatus;
         private CheckBox chkShowDate;
         private CheckBox chkShowTime;
         private CheckBox chkShowMilliseconds;
@@ -84,13 +89,13 @@ namespace QueenPix
             y += 40;
 
         // Frame Rate Control radio buttons
-        Label lblFrameRateControl = new Label
+        lblFrameRateHeader = new Label
         {
             Text = "Frame Rate Control:",
             Location = new System.Drawing.Point(leftMargin, y),
             Size = new System.Drawing.Size(labelWidth, 20)
         };
-        this.Controls.Add(lblFrameRateControl);
+        this.Controls.Add(lblFrameRateHeader);
 
         rbExternalTrigger = new RadioButton
         {
@@ -115,13 +120,13 @@ namespace QueenPix
         y += 35;
 
         // Software Frame Rate input
-        Label lblSoftwareFps = new Label
+        lblSoftwareFpsHeader = new Label
         {
             Text = "Software Frame Rate:",
             Location = new System.Drawing.Point(leftMargin, y),
             Size = new System.Drawing.Size(labelWidth, 20)
         };
-        this.Controls.Add(lblSoftwareFps);
+        this.Controls.Add(lblSoftwareFpsHeader);
 
         numSoftwareFps = new NumericUpDown
         {
@@ -151,7 +156,7 @@ namespace QueenPix
         y += 40;
 
             // Info note about external trigger
-            Label lblTriggerNote = new Label
+            lblTriggerNoteField = new Label
             {
                 Text = "ℹ️ Note: External function generator takes priority if connected",
                 Location = new System.Drawing.Point(leftMargin, y),
@@ -159,7 +164,7 @@ namespace QueenPix
                 ForeColor = System.Drawing.Color.Blue,
                 Font = new System.Drawing.Font("Arial", 8)
             };
-            this.Controls.Add(lblTriggerNote);
+            this.Controls.Add(lblTriggerNoteField);
             y += 35;
             
             // Date/Time Overlay Section
@@ -300,10 +305,89 @@ namespace QueenPix
                     cmbFormat.SelectedIndex = 0;
 
                 // Hide TIS-only controls for webcams
+                lblFrameRateHeader!.Visible = false;
                 rbExternalTrigger!.Visible = false;
                 rbSoftwareControlled!.Visible = false;
+                lblSoftwareFpsHeader!.Visible = false;
                 numSoftwareFps!.Visible = false;
                 lblFpsRange!.Visible = false;
+                lblTriggerNoteField!.Visible = false;
+
+                // Webcam FPS controls — probe device for supported values
+                int fpsY = 60; // same row as the hidden "Frame Rate Control:" area
+                Label lblFpsLabel = new Label
+                {
+                    Text = "Frame Rate:",
+                    Location = new System.Drawing.Point(leftMargin, fpsY + 2),
+                    Size = new System.Drawing.Size(labelWidth, 20)
+                };
+                this.Controls.Add(lblFpsLabel);
+
+                cmbWebcamFps = new ComboBox
+                {
+                    Location = new System.Drawing.Point(leftMargin + labelWidth, fpsY),
+                    Size = new System.Drawing.Size(100, 25),
+                    DropDownStyle = ComboBoxStyle.DropDownList
+                };
+                this.Controls.Add(cmbWebcamFps);
+
+                Label lblFpsUnit = new Label
+                {
+                    Text = "fps",
+                    Location = new System.Drawing.Point(leftMargin + labelWidth + 108, fpsY + 2),
+                    Size = new System.Drawing.Size(30, 20)
+                };
+                this.Controls.Add(lblFpsUnit);
+
+                lblWebcamFpsStatus = new Label
+                {
+                    Location = new System.Drawing.Point(leftMargin + labelWidth, fpsY + 28),
+                    Size = new System.Drawing.Size(360, 20),
+                    Font = new System.Drawing.Font("Arial", 8),
+                    ForeColor = System.Drawing.Color.Gray
+                };
+                this.Controls.Add(lblWebcamFpsStatus);
+
+                // Parse current resolution to pass to the FPS probe
+                int probeW = 640, probeH = 480;
+                string savedFmt = settings.Format ?? "";
+                if (savedFmt.Contains("x"))
+                {
+                    var p = savedFmt.Split('x');
+                    if (p.Length == 2 && int.TryParse(p[0], out int pw) && int.TryParse(p[1], out int ph))
+                    { probeW = pw; probeH = ph; }
+                }
+
+                // Probe (device was stopped by caller before opening this dialog)
+                var (supportedFps, isSoftwareControllable) = DirectShowHelper.GetSupportedFpsValues(webcamDeviceIndex, probeW, probeH);
+
+                foreach (double fps in supportedFps)
+                    cmbWebcamFps.Items.Add(fps);
+
+                // Pre-select the saved FPS (or closest available)
+                double savedFps = settings.SoftwareFrameRate > 0 ? settings.SoftwareFrameRate : 30;
+                int bestIdx = 0;
+                double bestDiff = double.MaxValue;
+                for (int i = 0; i < supportedFps.Count; i++)
+                {
+                    double diff = Math.Abs(supportedFps[i] - savedFps);
+                    if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+                }
+                if (cmbWebcamFps.Items.Count > 0)
+                    cmbWebcamFps.SelectedIndex = bestIdx;
+
+                double maxFps = supportedFps.Count > 0 ? supportedFps.Max() : 30;
+                if (isSoftwareControllable)
+                {
+                    lblWebcamFpsStatus.Text = $"Software controlled (driver accepted multiple rates)";
+                    lblWebcamFpsStatus.ForeColor = System.Drawing.Color.DarkGreen;
+                }
+                else
+                {
+                    lblWebcamFpsStatus.Text = $"Hardware limited to {maxFps:F0} fps (cannot be changed in software)";
+                    lblWebcamFpsStatus.ForeColor = System.Drawing.Color.OrangeRed;
+                    cmbWebcamFps.Enabled = false;
+                }
             }
 
             y += 15;
@@ -552,6 +636,12 @@ namespace QueenPix
                         settings.VCDPropertiesXml = imagingControl.VCDPropertyItems.Save();
                 }
                 catch { }
+            }
+            else
+            {
+                // Webcam: save selected FPS
+                if (cmbWebcamFps?.SelectedItem is double selectedFps)
+                    settings.SoftwareFrameRate = (float)selectedFps;
             }
 
             // Save date/time overlay settings (only if not Normal Recording mode)

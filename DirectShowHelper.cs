@@ -106,6 +106,58 @@ namespace QueenPix
             return result;
         }
 
+        // Standard FPS values to probe
+        private static readonly double[] ProbeFpsValues = { 5, 10, 12, 15, 20, 24, 25, 30, 60 };
+
+        /// <summary>
+        /// Probes a DirectShow device to find which FPS values it accepts at the given resolution.
+        /// Returns the supported FPS list and whether the driver accepts software FPS control.
+        /// Call only when the device is NOT already open elsewhere.
+        /// </summary>
+        public static (List<double> SupportedFps, bool IsSoftwareControllable) GetSupportedFpsValues(int deviceIndex, int width, int height)
+        {
+            var supported = new List<double>();
+            bool isSoftwareControllable = false;
+
+            try
+            {
+                using var cap = new VideoCapture(deviceIndex, (VideoCaptureAPIs)700);
+                if (!cap.IsOpened())
+                    return (new List<double> { 30 }, false);
+
+                cap.Set(VideoCaptureProperties.FrameWidth, width);
+                cap.Set(VideoCaptureProperties.FrameHeight, height);
+
+                var distinctActual = new HashSet<double>();
+
+                foreach (double probe in ProbeFpsValues)
+                {
+                    cap.Set(VideoCaptureProperties.Fps, probe);
+                    double actual = cap.Get(VideoCaptureProperties.Fps);
+                    if (actual > 0)
+                        distinctActual.Add(Math.Round(actual));
+                    // Accept within 10% of requested
+                    if (actual > 0 && actual / probe >= 0.9 && actual / probe <= 1.1)
+                        supported.Add(probe);
+                }
+
+                // Software controllable = driver returned more than one distinct FPS across all probes
+                isSoftwareControllable = distinctActual.Count > 1;
+
+                if (supported.Count == 0)
+                {
+                    double fallback = distinctActual.Count > 0 ? distinctActual.Max() : 30;
+                    supported.Add(fallback);
+                }
+            }
+            catch
+            {
+                supported.Add(30);
+            }
+
+            return (supported, isSoftwareControllable);
+        }
+
         // Standard resolutions to probe
         private static readonly (int W, int H)[] ProbeResolutions =
         {

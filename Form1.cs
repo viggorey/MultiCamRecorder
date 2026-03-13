@@ -114,7 +114,8 @@ namespace QueenPix
             public bool IsTimelapseMode { get; set; }
             public DateTime? LastTimelapseCapture { get; set; }
             public int TimelapseFrameCount { get; set; }
-            public List<string>? TimelapseImagePaths { get; set; }
+            public string? TimelapseFolder { get; set; }    // replaces per-frame path list to avoid RAM growth
+            public string? TimelapseBaseName { get; set; } // recording base name used in filenames, needed for image2 pattern
             public double TimelapseIntervalSeconds { get; set; }
 
             // Group assignment
@@ -315,6 +316,7 @@ namespace QueenPix
         private System.Drawing.Size ScaleSize(int width, int height) => new System.Drawing.Size(ScaleValue(width), ScaleValue(height));
         private System.Drawing.Size ScaleSize(System.Drawing.Size size) => ScaleSize(size.Width, size.Height);
         private int expandedCameraIndex = -1;
+        private bool _inUpdateExpandedLayout = false;
         private int currentPreviewWidth = 320;
         private int currentPreviewHeight = 240;
         private ComboBox cmbPreviewSize = null!;
@@ -4778,6 +4780,7 @@ namespace QueenPix
                                     camera.WebcamCapture = new VideoCapture(camera.WebcamDeviceIndex, (VideoCaptureAPIs)700);
                                     camera.WebcamCapture.Set(VideoCaptureProperties.FrameWidth, camera.WebcamResolution.Width);
                                     camera.WebcamCapture.Set(VideoCaptureProperties.FrameHeight, camera.WebcamResolution.Height);
+                                    camera.WebcamCapture.Set(VideoCaptureProperties.Fps, camera.Settings.SoftwareFrameRate);
                                     camera.LastFpsUpdate = DateTime.Now;
                                     camera.WebcamFrameCount = 0;
                                     var wc = camera;
@@ -5432,6 +5435,7 @@ namespace QueenPix
                                             cameras[i].WebcamCapture = new VideoCapture(cameras[i].WebcamDeviceIndex, (VideoCaptureAPIs)700);
                                             cameras[i].WebcamCapture.Set(VideoCaptureProperties.FrameWidth, cameras[i].WebcamResolution.Width);
                                             cameras[i].WebcamCapture.Set(VideoCaptureProperties.FrameHeight, cameras[i].WebcamResolution.Height);
+                                            cameras[i].WebcamCapture.Set(VideoCaptureProperties.Fps, cameras[i].Settings.SoftwareFrameRate);
                                             var wc = cameras[i];
                                             cameras[i].WebcamThread = new Thread(() => RunWebcamCaptureLoop(wc));
                                             cameras[i].WebcamThread.IsBackground = true;
@@ -5470,6 +5474,7 @@ namespace QueenPix
                         camera.WebcamCapture = new VideoCapture(camera.WebcamDeviceIndex, (VideoCaptureAPIs)700);
                         camera.WebcamCapture.Set(VideoCaptureProperties.FrameWidth, camera.WebcamResolution.Width);
                         camera.WebcamCapture.Set(VideoCaptureProperties.FrameHeight, camera.WebcamResolution.Height);
+                        camera.WebcamCapture.Set(VideoCaptureProperties.Fps, camera.Settings.SoftwareFrameRate);
                         camera.LastFpsUpdate = DateTime.Now;
                         camera.WebcamFrameCount = 0;
                         var wc = camera;
@@ -5769,6 +5774,13 @@ namespace QueenPix
 
         private void UpdateExpandedLayout()
         {
+            if (_inUpdateExpandedLayout) return;
+            _inUpdateExpandedLayout = true;
+            try { UpdateExpandedLayoutCore(); } finally { _inUpdateExpandedLayout = false; }
+        }
+
+        private void UpdateExpandedLayoutCore()
+        {
             var expandedCamera = cameras[expandedCameraIndex];
             
             // Hide all other cameras
@@ -5847,6 +5859,9 @@ namespace QueenPix
             int maxHeight = availableHeight - controlsHeight - 10; // 10px bottom margin
             int maxWidth = availableWidth - 10;   // Minimal side margins
 
+            if (maxWidth <= 0 || maxHeight <= 0)
+                return; // Window too small to render anything meaningful
+
             if ((float)maxWidth / maxHeight > aspectRatio)
             {
                 // Height is limiting factor - use full height
@@ -5859,6 +5874,10 @@ namespace QueenPix
                 expandedWidth = maxWidth;
                 expandedHeight = (int)(expandedWidth / aspectRatio);
             }
+
+            // Clamp to at least 1px to avoid ArgumentException on Size assignment
+            expandedWidth = Math.Max(1, expandedWidth);
+            expandedHeight = Math.Max(1, expandedHeight);
 
             // Center horizontally
             int xPosition = SIDE_MARGIN + (availableWidth - expandedWidth) / 2;
@@ -5953,11 +5972,16 @@ namespace QueenPix
             this.PerformLayout();
             this.Invalidate(true);
             this.Update();
-            
-            // Give the control time to process the resize, especially for Y800 format
-            Application.DoEvents();
-            System.Threading.Thread.Sleep(100);
-            Application.DoEvents();
+
+            // Give the TIS control time to process the resize, especially for Y800 format.
+            // Not needed for webcams (PictureBox stretches immediately), and skipping DoEvents
+            // on webcam paths avoids re-entrant layout calls from pending Windows messages.
+            if (expandedCamera.IsImagingSource)
+            {
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(100);
+                Application.DoEvents();
+            }
             
             // Add "Back to Grid" label if not already present
             Label? backLabel = this.Controls.OfType<Label>().FirstOrDefault(l => l.Tag?.ToString() == "backToGrid");
@@ -6220,6 +6244,7 @@ namespace QueenPix
                             camera.WebcamCapture = new VideoCapture(camera.WebcamDeviceIndex, (VideoCaptureAPIs)700);
                             camera.WebcamCapture.Set(VideoCaptureProperties.FrameWidth, camera.WebcamResolution.Width);
                             camera.WebcamCapture.Set(VideoCaptureProperties.FrameHeight, camera.WebcamResolution.Height);
+                            camera.WebcamCapture.Set(VideoCaptureProperties.Fps, camera.Settings.SoftwareFrameRate);
                             camera.LastFpsUpdate = DateTime.Now;
                             camera.WebcamFrameCount = 0;
                             camera.WebcamThread = new Thread(() => RunWebcamCaptureLoop(camera));
@@ -6650,7 +6675,8 @@ namespace QueenPix
                             camera.TimelapseIntervalSeconds = intervalSeconds;
                             camera.TimelapseFrameCount = 0;
                             camera.LastTimelapseCapture = null;
-                            camera.TimelapseImagePaths = new List<string>();
+                            camera.TimelapseFolder = null;
+                            camera.TimelapseBaseName = null;
                             
                             LogCameraInfo($"{camera.CustomName}: Timelapse initialized - interval {intervalSeconds}s");
                         }
@@ -6718,7 +6744,7 @@ namespace QueenPix
                                 string camName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
                                 string camFolder = Path.Combine(timelapseMainFolder, camName);
                                 Directory.CreateDirectory(camFolder);
-                                camera.TimelapseImagePaths ??= new List<string>();
+                                camera.TimelapseFolder = camFolder;
                                 LogCameraInfo($"Webcam {camera.CustomName}: timelapse folder {camFolder}");
                             }
                             successCount++;
@@ -7006,7 +7032,9 @@ namespace QueenPix
                                                 string cameraName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
                                                 string timelapseMainFolder = Path.Combine(workingFolder, $"Timelapse_Frames_{capturedBaseName}");
                                                 string cameraFolder = Path.Combine(timelapseMainFolder, cameraName);
-                                                string frameNumber = camera.TimelapseFrameCount.ToString("D6");
+                                                camera.TimelapseFolder ??= cameraFolder;     // store once for compilation later
+                                                camera.TimelapseBaseName ??= capturedBaseName;
+                                                string frameNumber = camera.TimelapseFrameCount.ToString("D8"); // D8 supports up to 99,999,999 frames
                                                 string imagePath = Path.Combine(cameraFolder, $"{capturedBaseName}_{cameraName}_{frameNumber}.png");
 
                                                 System.Drawing.Bitmap finalBitmap = clone;
@@ -7027,10 +7055,11 @@ namespace QueenPix
                                                         finalBitmap.Dispose();
                                                 }
 
-                                                camera.TimelapseImagePaths!.Add(imagePath);
                                                 camera.TimelapseFrameCount++;
                                                 camera.LastTimelapseCapture = now;
-                                                LogCameraInfo($"{camera.CustomName}: Captured timelapse frame {camera.TimelapseFrameCount}");
+                                                // Throttle: log every 100 frames to avoid a multi-MB log file
+                                                if (camera.TimelapseFrameCount % 100 == 1)
+                                                    LogCameraInfo($"{camera.CustomName}: Timelapse frame {camera.TimelapseFrameCount} captured");
                                             }
                                         }
                                     }
@@ -8688,7 +8717,7 @@ namespace QueenPix
             {
                 // Check if any cameras have captured frames (limited to this group's cameras if specified)
                 var searchCameras = groupCameras ?? cameras;
-                var camerasWithFrames = searchCameras.Where(c => c.TimelapseImagePaths != null && c.TimelapseImagePaths.Count > 0).ToList();
+                var camerasWithFrames = searchCameras.Where(c => c.TimelapseFolder != null && c.TimelapseFrameCount > 0).ToList();
                 
                 if (camerasWithFrames.Count == 0)
                 {
@@ -8964,33 +8993,26 @@ namespace QueenPix
                 try
                 {
                     string cameraName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
-                    // Derive folder from the actual saved frame paths (avoids hardcoded path mismatch)
-                    string timelapseFolder = camera.TimelapseImagePaths!.Count > 0
-                        ? Path.GetDirectoryName(camera.TimelapseImagePaths[0])!
-                        : Path.Combine(txtWorkingFolder.Text, $"Timelapse_Frames_{currentRecordingBaseName}", cameraName);
+                    // Derive folder from stored path (set on first frame capture)
+                    string timelapseFolder = camera.TimelapseFolder
+                        ?? Path.Combine(txtWorkingFolder.Text, $"Timelapse_Frames_{currentRecordingBaseName}", cameraName);
 
-                    // Create file list for FFmpeg
-                    string fileListPath = Path.Combine(timelapseFolder, "filelist.txt");
-                    using (StreamWriter writer = new StreamWriter(fileListPath))
-                    {
-                        foreach (string imagePath in camera.TimelapseImagePaths!)
-                        {
-                            // FFmpeg concat requires proper escaping
-                            string escapedPath = imagePath.Replace("\\", "/").Replace("'", "'\\''");
-                            writer.WriteLine($"file '{escapedPath}'");
-                        }
-                    }
-                    
+                    // Use image2 demuxer — reads frames directly by filename pattern, no filelist.txt needed.
+                    // This handles millions of files efficiently; concat demuxer would require a ~150 MB list file.
+                    // Frames are named {baseName}_{cameraName}_%08d.png starting at 00000000.
+                    string baseName = camera.TimelapseBaseName ?? currentRecordingBaseName;
+                    string framePattern = Path.Combine(timelapseFolder, $"{baseName}_{cameraName}_%08d.png");
+
                     // Output video path
                     string extension = outputMP4 ? ".mp4" : ".avi";
-                    string outputVideo = Path.Combine(txtWorkingFolder.Text, $"{currentRecordingBaseName}_{cameraName}_timelapse{extension}");
-                    
+                    string outputVideo = Path.Combine(txtWorkingFolder.Text, $"{baseName}_{cameraName}_timelapse{extension}");
+
                     // FFmpeg command
-                    string codec = outputMP4 
-                        ? "-c:v libx264 -pix_fmt yuv420p -preset medium -crf 23" 
+                    string codec = outputMP4
+                        ? "-c:v libx264 -pix_fmt yuv420p -preset medium -crf 18"
                         : "-c:v rawvideo -pix_fmt bgr24";
-                    
-                    string ffmpegArgs = $"-f concat -safe 0 -r {outputFps:F3} -i \"{fileListPath}\" {codec} -y \"{outputVideo}\"";
+
+                    string ffmpegArgs = $"-framerate {outputFps:F3} -start_number 0 -i \"{framePattern}\" {codec} -y \"{outputVideo}\"";
                     
                     LogCameraInfo($"Compiling timelapse for {camera.CustomName}: {camera.TimelapseFrameCount} frames at {outputFps} fps");
                     LogCameraInfo($"FFmpeg command: ffmpeg {ffmpegArgs}");
@@ -9060,8 +9082,6 @@ namespace QueenPix
                         }
                     }
                     
-                    // Clean up file list
-                    try { File.Delete(fileListPath); } catch { }
                 }
                 catch (Exception ex)
                 {
@@ -9595,7 +9615,7 @@ namespace QueenPix
                     }
                     
                     // Build FFmpeg command
-                    string codec = outputMP4 ? "-c:v libx264 -pix_fmt yuv420p -preset fast -crf 23" : "-c:v copy";
+                    string codec = outputMP4 ? "-c:v libx264 -pix_fmt yuv420p -preset fast -crf 18" : "-c:v copy";
                     
                     ProcessStartInfo startInfo = new ProcessStartInfo
                     {
