@@ -1,0 +1,21 @@
+name: queenpix
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  # Note: .NET SDK 8.0 is required but not available via conda
+  # Please install .NET SDK 8.0 separately from:
+  # https://dotnet.microsoft.com/download/dotnet/8.0
+  # 
+  # The project uses NuGet packages managed by .NET:
+  # - Microsoft.VisualBasic (10.0.0)
+  # - OpenCvSharp4 (4.11.0.20250507)
+  # - OpenCvSharp4.Extensions (4.11.0.20250507)
+  # - OpenCvSharp4.runtime.win (4.11.0.20250507)
+  #
+  # Additional requirements:
+  # - TIS.Imaging SDK (must be installed separately)
+  # - FFmpeg (included in tools/ folder)
+  # - Camera drivers (must be installed separately)

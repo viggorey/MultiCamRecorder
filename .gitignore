@@ -43,6 +43,10 @@ tools/ffprobe.exe
 # QueenPix folder (contains large executables)
 QueenPix/
 QueenPix_Lab_*.zip
+QueenPix_Lab.zip
+
+# Claude Code session data
+.claude/
 
 # Visual Studio cache/options directory
 .vs/

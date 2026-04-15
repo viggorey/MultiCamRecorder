@@ -125,6 +125,11 @@ namespace QueenPix
             // Camera type flag
             public bool IsImagingSource { get; set; } = true;
 
+            // NativeWindow hook used to capture mouse clicks on TIS ImagingControl.
+            // The native DirectShow child window inside ImagingControl swallows WM_LBUTTONDOWN
+            // before WinForms can raise Click/MouseClick, so we hook at the Win32 level instead.
+            public ImagingControlClickHook? ClickHook { get; set; }
+
             // Webcam-specific fields
             public int WebcamDeviceIndex { get; set; }
             public VideoCapture? WebcamCapture { get; set; }
@@ -317,6 +322,7 @@ namespace QueenPix
         private System.Drawing.Size ScaleSize(System.Drawing.Size size) => ScaleSize(size.Width, size.Height);
         private int expandedCameraIndex = -1;
         private bool _inUpdateExpandedLayout = false;
+        private long _lastExpansionToggleTick = 0; // Environment.TickCount64 of last ToggleCameraExpansion call
         private int currentPreviewWidth = 320;
         private int currentPreviewHeight = 240;
         private ComboBox cmbPreviewSize = null!;
@@ -432,7 +438,12 @@ namespace QueenPix
             ToolStripMenuItem recordingTestItem = new ToolStripMenuItem("Recording Test...");
             recordingTestItem.Click += (s, e) => RunRecordingTest();
             toolsMenu.DropDownItems.Add(recordingTestItem);
-            
+
+            toolsMenu.DropDownItems.Add(new ToolStripSeparator());
+            ToolStripMenuItem centrifugeItem = new ToolStripMenuItem("Centrifuge Analysis...");
+            centrifugeItem.Click += (s, e) => new CentrifugeAnalysisDialog().ShowDialog(this);
+            toolsMenu.DropDownItems.Add(centrifugeItem);
+
             // Settings menu
             ToolStripMenuItem settingsMenu = new ToolStripMenuItem("Settings");
             ToolStripMenuItem preferencesItem = new ToolStripMenuItem("Preferences...");
@@ -4100,9 +4111,11 @@ namespace QueenPix
                                         "Camera Lost", MessageBoxButtons.OK, MessageBoxIcon.Error);
                         }
                     };
-                    // Add click handler for expanding preview
-                    int clickIndex = i;  // Capture for click handler
-                    camera.ImagingControl.MouseClick += (s, e) => ToggleCameraExpansion(clickIndex); 
+                    // Hook the ImagingControl's HWND to catch clicks on its native DirectShow
+                    // child window (which swallows WM_LBUTTONDOWN before WinForms sees it).
+                    int clickIndex = i;
+                    camera.ClickHook = new ImagingControlClickHook(
+                        camera.ImagingControl, () => ToggleCameraExpansion(clickIndex));
                 }
                 catch (Exception ex)
                 {
@@ -4795,6 +4808,9 @@ namespace QueenPix
                         btnStartLive.Enabled = false;
                         btnStopLive.Enabled = true;
                         btnStartRecording.Enabled = true;
+
+                        // Re-apply display settings after LiveStart() resets LiveDisplayDefault.
+                        UpdateCameraLayout();
                     }
 
                     MessageBox.Show($"Camera configuration updated!\n\nActive cameras: {cameras.Count}",
@@ -4804,6 +4820,10 @@ namespace QueenPix
         }
         private void RebuildCameraList()
         {
+            // Always reset expanded state — the camera list is about to be rebuilt from scratch
+            // and any stale index would auto-expand the wrong (or only) remaining camera.
+            expandedCameraIndex = -1;
+
             // Save current custom names before clearing
             Dictionary<string, string> savedNames = new Dictionary<string, string>();
             foreach (var cam in cameras)
@@ -4834,6 +4854,8 @@ namespace QueenPix
                 this.Controls.Remove(cam.SettingsButton);
                 if (cam.TriggerButton != null)
                     this.Controls.Remove(cam.TriggerButton);
+                cam.ClickHook?.Detach();
+                cam.ClickHook = null;
                 if (cam.GroupIndicatorLabel != null)
                 {
                     this.Controls.Remove(cam.GroupIndicatorLabel);
@@ -5000,15 +5022,16 @@ namespace QueenPix
                                         "Camera Lost", MessageBoxButtons.OK, MessageBoxIcon.Error);
                         }
                     };
-                    // Add click handler for expanding preview
-                    int clickIndex = i;  // Capture for click handler
-                    camera.ImagingControl.Click += (s, e) => ToggleCameraExpansion(clickIndex);
+                    // Same hook approach as in DetectAndSetupCameras.
+                    int clickIndex = i;
+                    camera.ClickHook = new ImagingControlClickHook(
+                        camera.ImagingControl, () => ToggleCameraExpansion(clickIndex));
                 }
                 catch (Exception ex)
                 {
                     LogCameraInfo($"Error setting up camera {i + 1} ({deviceName}): {ex.Message}");
                 }
-                
+
                 this.Controls.Add(camera.ImagingControl);
                 cameras.Add(camera);
             }
@@ -5793,7 +5816,8 @@ namespace QueenPix
                     cameras[i].FpsLabel.Visible = false;
                     cameras[i].SettingsButton.Visible = false;
                     cameras[i].TriggerButton.Visible = false;
-                    cameras[i].ImagingControl.Visible = false;
+                    if (cameras[i].IsImagingSource)
+                        cameras[i].ImagingControl.Visible = false;
                     if (!cameras[i].IsImagingSource && cameras[i].WebcamPreview != null)
                         cameras[i].WebcamPreview.Visible = false;
                     if (cameras[i].GroupIndicatorLabel != null)
@@ -5927,6 +5951,9 @@ namespace QueenPix
 
             if (!expandedCamera.IsImagingSource && expandedCamera.WebcamPreview != null)
             {
+                // Zoom mode shows the entire frame at correct aspect ratio (with letterboxing if
+                // the PictureBox aspect differs from the frame); StretchImage would distort.
+                expandedCamera.WebcamPreview.SizeMode = System.Windows.Forms.PictureBoxSizeMode.Zoom;
                 expandedCamera.WebcamPreview.Location = new System.Drawing.Point(xPosition, yPosition + 75);
                 expandedCamera.WebcamPreview.Size = new System.Drawing.Size(expandedWidth, expandedHeight);
                 expandedCamera.WebcamPreview.Visible = true;
@@ -5934,20 +5961,15 @@ namespace QueenPix
             }
             else
             {
-                // Set size and location before making visible
-                expandedCamera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 75);
-                expandedCamera.ImagingControl.Size = new System.Drawing.Size(expandedWidth, expandedHeight);
-
-                // Ensure LiveDisplay is enabled (required for proper rendering)
-                expandedCamera.ImagingControl.LiveDisplay = true;
-
-                // CRITICAL: Set LiveDisplayDefault to false to allow custom sizing
-                // Then set LiveDisplayWidth and LiveDisplayHeight to match the control size
-                // This is especially important for Y800 format cameras which don't auto-resize
+                // Set LiveDisplay scaling BEFORE resizing the control so the SDK never
+                // clips a frame at the old (smaller) scale during the transition.
                 expandedCamera.ImagingControl.LiveDisplayDefault = false;
                 expandedCamera.ImagingControl.LiveDisplayWidth = expandedWidth;
                 expandedCamera.ImagingControl.LiveDisplayHeight = expandedHeight;
+                expandedCamera.ImagingControl.LiveDisplay = true;
 
+                expandedCamera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 75);
+                expandedCamera.ImagingControl.Size = new System.Drawing.Size(expandedWidth, expandedHeight);
                 expandedCamera.ImagingControl.Visible = true;
                 expandedCamera.ImagingControl.BringToFront();
             }
@@ -6117,17 +6139,22 @@ namespace QueenPix
                 }
                 else
                 {
-                    camera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 68);
-                    camera.ImagingControl.Size = new System.Drawing.Size(currentPreviewWidth, currentPreviewHeight);
-
-                    // CRITICAL: Set LiveDisplayDefault to false to allow custom sizing
-                    // Then set LiveDisplayWidth and LiveDisplayHeight to match the control size
-                    // This ensures the full camera view is scaled to fit, not just showing top-left corner
+                    // Set LiveDisplay scaling BEFORE resizing the control so the SDK never
+                    // renders a frame at the wrong size and clips it.
                     camera.ImagingControl.LiveDisplayDefault = false;
                     camera.ImagingControl.LiveDisplayWidth = currentPreviewWidth;
                     camera.ImagingControl.LiveDisplayHeight = currentPreviewHeight;
 
+                    camera.ImagingControl.Location = new System.Drawing.Point(xPosition, yPosition + 68);
+                    camera.ImagingControl.Size = new System.Drawing.Size(currentPreviewWidth, currentPreviewHeight);
                     camera.ImagingControl.Visible = true;
+
+                    // Force a repaint so the new scale takes effect on the already-visible frame.
+                    if (camera.ImagingControl.LiveVideoRunning)
+                    {
+                        camera.ImagingControl.Invalidate();
+                        camera.ImagingControl.Refresh();
+                    }
                 }
             }
             
@@ -6263,6 +6290,11 @@ namespace QueenPix
                 btnStopLive.Enabled = true;
                 btnScreenshot.Enabled = true;
                 btnStartRecording.Enabled = true;
+
+                // Re-apply display settings now that cameras are live.  The TIS SDK may
+                // reset LiveDisplayDefault to true on LiveStart(), which would cause the
+                // native-resolution image to be clipped instead of scaled to fit the control.
+                UpdateCameraLayout();
 
                 // Only show popup if there were errors
                 if (errors.Count > 0)
@@ -6467,21 +6499,23 @@ namespace QueenPix
                         {
                             ImageBuffer? imageBuffer = null;
                             
-                            // Try multiple methods to get image buffer, depending on current mode
-                            
-                            // Method 1: If using FrameHandlerSink (loop recording, timelapse, or live preview)
-                            // Note: Live preview now always uses FrameHandlerSink, so this should always work
+                            // Method 1: active sink is FrameHandlerSink (live preview, loop, timelapse)
                             if (camera.ImagingControl.Sink is FrameHandlerSink frameHandlerSink)
                             {
                                 imageBuffer = frameHandlerSink.LastAcquiredBuffer;
                             }
-                            // Method 2: If recording with MediaStreamSink, try original sink (FrameHandlerSink from preview)
+                            // Method 2: normal recording — active sink is MediaStreamSink; try the
+                            // FrameHandlerSink that was active during live preview (stored in OriginalSink).
+                            // Its LastAcquiredBuffer may be null if the SDK released it on LiveStop().
                             else if (camera.OriginalSink is FrameHandlerSink originalFrameHandlerSink)
                             {
                                 imageBuffer = originalFrameHandlerSink.LastAcquiredBuffer;
                             }
-                            // Method 3: Fallback - try ImageActiveBuffer (for MediaStreamSink recording)
-                            else
+
+                            // Method 3: final fallback — ImageActiveBuffer (valid during frame delivery).
+                            // Always attempted when the above methods yield nothing, regardless of which
+                            // path was taken (fixes the silent skip when Method 2 returns null).
+                            if (imageBuffer == null)
                             {
                                 imageBuffer = camera.ImagingControl.ImageActiveBuffer;
                             }
@@ -8635,14 +8669,21 @@ namespace QueenPix
                                 Application.DoEvents();
                                 
                                 TimeSpan conversionTime = DateTime.Now - fileStartTime;
-                                
+
                                 if (deleteOriginals)
                                 {
                                     File.Delete(aviFile);
                                 }
                                 convertedFiles.Add(mp4File);
                                 successCount++;
-                                
+
+                                // Generate JSON timestamp file for the MP4
+                                if (recordingStartTime.HasValue)
+                                {
+                                    DateTime adjustedStartTime = recordingStartTime.Value.AddSeconds(startTime_sec);
+                                    GenerateTimestampFile(mp4File, adjustedStartTime, fps, i < cameras.Count ? i : null);
+                                }
+
                                 LogCameraInfo($"Converted {fileName} in {conversionTime.TotalSeconds:F1}s");
                             }
                             else
@@ -8657,10 +8698,10 @@ namespace QueenPix
                             string errorMsg = $"Exit code: {process.ExitCode}";
                             if (!string.IsNullOrEmpty(lastError))
                                 errorMsg += $"\n{lastError}";
-                            
+
                             errorMessages.Add($"{fileName}: {errorMsg}");
                             failCount++;
-                            
+
                             if (File.Exists(mp4File))
                                 File.Delete(mp4File);
                         }
@@ -10322,6 +10363,15 @@ namespace QueenPix
 
         private void ToggleCameraExpansion(int cameraIndex)
         {
+            // Debounce: a single physical click on a TIS camera can generate both
+            // WM_PARENTNOTIFY and WM_LBUTTONDOWN, which would fire this method twice
+            // and immediately undo the expansion.  Ignore calls within 500 ms of the
+            // last accepted toggle to absorb the duplicate message.
+            long now = Environment.TickCount64;
+            if (now - _lastExpansionToggleTick < 500)
+                return;
+            _lastExpansionToggleTick = now;
+
             if (expandedCameraIndex == cameraIndex)
             {
                 // Already expanded, collapse back to grid
@@ -10332,7 +10382,7 @@ namespace QueenPix
                 // Expand this camera
                 expandedCameraIndex = cameraIndex;
             }
-            
+
             UpdateCameraLayout();
         }
 
@@ -10377,6 +10427,54 @@ namespace QueenPix
             catch { }
 
             return 0;
+        }
+
+        // -------------------------------------------------------------------------
+        // NativeWindow hook that detects left-clicks on a TIS ImagingControl.
+        //
+        // The ICImagingControl renders into a native child HWND (DirectShow VMR/EVR).
+        // That child owns WM_LBUTTONDOWN so WinForms Click/MouseClick never fire.
+        // We attach this hook to the ImagingControl's own HWND and listen for
+        //   • WM_LBUTTONDOWN  – fires if the top-level ImagingControl HWND gets the click
+        //   • WM_PARENTNOTIFY – fires when the rendering child HWND gets a click and
+        //                       forwards WM_LBUTTONDOWN notification up via DefWindowProc
+        // -------------------------------------------------------------------------
+        internal class ImagingControlClickHook : NativeWindow
+        {
+            private const int WM_LBUTTONDOWN  = 0x0201;
+            private const int WM_PARENTNOTIFY = 0x0210;
+
+            private readonly Action _onLeftClick;
+
+            public ImagingControlClickHook(Control control, Action onLeftClick)
+            {
+                _onLeftClick = onLeftClick;
+                if (control.IsHandleCreated)
+                    AssignHandle(control.Handle);
+                else
+                    control.HandleCreated += OnHandleCreated;
+            }
+
+            private void OnHandleCreated(object? sender, EventArgs e)
+            {
+                if (sender is Control c)
+                {
+                    c.HandleCreated -= OnHandleCreated;
+                    AssignHandle(c.Handle);
+                }
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                base.WndProc(ref m);
+                if (m.Msg == WM_LBUTTONDOWN ||
+                    (m.Msg == WM_PARENTNOTIFY && (m.WParam.ToInt32() & 0xFFFF) == WM_LBUTTONDOWN))
+                {
+                    _onLeftClick();
+                }
+            }
+
+            public void Detach() => ReleaseHandle();
         }
     }
 }

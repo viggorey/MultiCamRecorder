@@ -268,10 +268,10 @@ namespace QueenPix
             
             Label lblJsonWarning = new Label
             {
-                Text = "⚠️ Note: JSON files are only generated when saving as AVI format",
+                Text = "ℹ️ Note: JSON files are generated alongside the saved video file",
                 Location = new System.Drawing.Point(leftMargin + labelWidth, y - 5),
                 Size = new System.Drawing.Size(340, 30),
-                ForeColor = System.Drawing.Color.Orange,
+                ForeColor = System.Drawing.Color.Gray,
                 Font = new System.Drawing.Font("Arial", 8)
             };
             this.Controls.Add(lblJsonWarning);

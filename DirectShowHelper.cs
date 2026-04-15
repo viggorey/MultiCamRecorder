@@ -82,6 +82,7 @@ namespace QueenPix
 
                 var monikers = new IMoniker[1];
                 int idx = 0;
+                var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 while (enumMoniker.Next(1, monikers, IntPtr.Zero) == 0)
                 {
                     try
@@ -93,7 +94,13 @@ namespace QueenPix
                         object nameVar = "";
                         bag.Read("FriendlyName", ref nameVar, IntPtr.Zero);
                         string name = nameVar?.ToString() ?? $"Camera {idx}";
-                        result.Add((name, idx));
+
+                        // Skip devices whose friendly-name has already been seen.
+                        // Windows often registers the same physical camera twice (e.g. RGB + IR
+                        // entries for a built-in webcam).  The first entry (lowest index) is the
+                        // one OpenCV will open successfully, so keep that one.
+                        if (seenNames.Add(name))
+                            result.Add((name, idx));
                     }
                     catch { result.Add(($"Camera {idx}", idx)); }
                     finally { if (monikers[0] != null) Marshal.ReleaseComObject(monikers[0]); }
