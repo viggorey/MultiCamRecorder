@@ -46,6 +46,12 @@ namespace QueenPix
         public Dictionary<string, string> GroupNames { get; set; } = new()
             { ["A"] = "Group A", ["B"] = "Group B", ["C"] = "Group C", ["D"] = "Group D" };
         public List<string> ActiveGroupIds { get; set; } = new() { "A", "B" };
+
+        // Webcam visibility: devices the user has explicitly managed via Manage Cameras
+        public List<string> KnownWebcamDevices { get; set; } = new();
+        // Persisted exclusion list (updated whenever Manage Cameras is closed with OK)
+        public List<string> ExcludedCameraDevices { get; set; } = new();
+
         public static UserSettings Load()
         {
             try
@@ -4128,10 +4134,24 @@ namespace QueenPix
             }
 
             // ---- Webcam enumeration ----
-            // Get all DirectShow video devices and filter out any that are TIS cameras
+            // Reload exclusions from persisted settings (covers Refresh Cameras scenario)
+            excludedCameraDevices = new HashSet<string>(settings.ExcludedCameraDevices, StringComparer.OrdinalIgnoreCase);
+
             var tisNames = new HashSet<string>(deviceNames, StringComparer.OrdinalIgnoreCase);
             var allDirectShowDevices = DirectShowHelper.EnumerateVideoDevices();
-            var webcamDevices = allDirectShowDevices.Where(d => !tisNames.Contains(d.Name)).ToList();
+
+            // Auto-exclude any webcam the user has never explicitly managed — webcams are
+            // opt-in by default so the laptop's built-in camera doesn't appear uninvited.
+            var knownWebcams = new HashSet<string>(settings.KnownWebcamDevices, StringComparer.OrdinalIgnoreCase);
+            foreach (var (name, _) in allDirectShowDevices.Where(d => !tisNames.Contains(d.Name)))
+            {
+                if (!knownWebcams.Contains(name))
+                    excludedCameraDevices.Add(name);
+            }
+
+            var webcamDevices = allDirectShowDevices
+                .Where(d => !tisNames.Contains(d.Name) && !excludedCameraDevices.Contains(d.Name))
+                .ToList();
 
             int webcamStartIndex = cameras.Count; // position offset for layout
             for (int wi = 0; wi < webcamDevices.Count; wi++)
@@ -4645,7 +4665,7 @@ namespace QueenPix
 
             Label lblNote = new Label
             {
-                Text = "Unchecked cameras will be removed from the session.\nCheck to re-add previously removed cameras.",
+                Text = "Webcams are hidden by default — check one to enable it.\nUncheck any camera to hide it from the session.",
                 Location = new System.Drawing.Point(20, y),
                 Size = new System.Drawing.Size(450, 35),
                 ForeColor = System.Drawing.Color.Gray,
@@ -4746,6 +4766,16 @@ namespace QueenPix
                     if (!deviceCheckboxes[i].Checked)
                         excludedCameraDevices.Add(deviceEntries[i].Name);
                 }
+
+                // Mark all webcams shown in this dialog as acknowledged (opt-in seen)
+                foreach (var (name, isWebcam, _) in deviceEntries)
+                {
+                    if (isWebcam && !settings.KnownWebcamDevices.Contains(name))
+                        settings.KnownWebcamDevices.Add(name);
+                }
+                // Persist both the exclusion list and the known-webcams list
+                settings.ExcludedCameraDevices = excludedCameraDevices.ToList();
+                settings.Save();
 
                 // Check if anything actually changed
                 var currentDevices = cameras.Select(c => c.DeviceName).ToHashSet();
