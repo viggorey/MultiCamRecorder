@@ -40,11 +40,15 @@ namespace QueenPix
         
         private void InitializeDialog()
         {
+            var screen = Screen.FromPoint(System.Windows.Forms.Cursor.Position);
+            int formWidth = Math.Min(1400, screen.WorkingArea.Width - 40);
+            int formHeight = Math.Min(1020, screen.WorkingArea.Height - 40);
+
             this.Text = "Trim Videos";
-            this.Size = new System.Drawing.Size(1400, 1020);  // ← Increased from 750 to 850
+            this.Size = new System.Drawing.Size(formWidth, formHeight);
             this.StartPosition = FormStartPosition.CenterParent;
             this.FormBorderStyle = FormBorderStyle.Sizable;
-            this.MinimumSize = new System.Drawing.Size(1400, 1020);  // ← Increased from 750 to 850  // ← Increased from 680 to 750
+            this.MinimumSize = new System.Drawing.Size(900, 650);
             this.MaximizeBox = true;
             this.MinimizeBox = true;
             
@@ -213,39 +217,48 @@ namespace QueenPix
 
             y += 30;
             
-            // Camera preview grid panel - larger to show recording size
+            const int buttonAreaHeight = 65; // 35px button + 30px margins
+
+            // Camera preview grid panel — anchored to fill all available space
             gridPanel = new Panel
             {
                 Location = new System.Drawing.Point(leftMargin, y),
-                Size = new System.Drawing.Size(1340, 660),  // ← Increased from 480 to 580
+                Size = new System.Drawing.Size(
+                    this.ClientSize.Width - leftMargin * 2,
+                    this.ClientSize.Height - y - buttonAreaHeight),
                 BorderStyle = BorderStyle.FixedSingle,
-                AutoScroll = true
+                AutoScroll = true,
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
             };
             this.Controls.Add(gridPanel);
-            
+
             // Create camera preview controls
             cameraControls = new List<CameraPreviewControl>();
             CreateCameraGrid();
-            
-            y += 670;
-            
-            // Buttons
+
+            // Buttons — anchored to bottom-right so they're always visible
             Button btnCancel = new Button
             {
                 Text = "Cancel",
-                Location = new System.Drawing.Point(1150, y),
                 Size = new System.Drawing.Size(100, 35),
-                DialogResult = DialogResult.Cancel
+                DialogResult = DialogResult.Cancel,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Right
             };
+            btnCancel.Location = new System.Drawing.Point(
+                this.ClientSize.Width - 230,
+                this.ClientSize.Height - 50);
             this.Controls.Add(btnCancel);
-            
+
             Button btnApply = new Button
             {
                 Text = "Apply",
-                Location = new System.Drawing.Point(1260, y),
                 Size = new System.Drawing.Size(100, 35),
-                DialogResult = DialogResult.OK
+                DialogResult = DialogResult.OK,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Right
             };
+            btnApply.Location = new System.Drawing.Point(
+                this.ClientSize.Width - 120,
+                this.ClientSize.Height - 50);
             this.Controls.Add(btnApply);
             
             this.AcceptButton = btnApply;
