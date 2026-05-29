@@ -131,9 +131,6 @@ namespace QueenPix
             // Camera type flag
             public bool IsImagingSource { get; set; } = true;
 
-            // Hardware trigger state (reflects actual camera VCD state)
-            public bool HardwareTriggerEnabled { get; set; } = false;
-
             // NativeWindow hook used to capture mouse clicks on TIS ImagingControl.
             // The native DirectShow child window inside ImagingControl swallows WM_LBUTTONDOWN
             // before WinForms can raise Click/MouseClick, so we hook at the Win32 level instead.
@@ -436,9 +433,6 @@ namespace QueenPix
             ToolStripMenuItem convertItem = new ToolStripMenuItem("Convert AVIs to MP4...");
             convertItem.Click += ConvertAvisMenuItem_Click;
             toolsMenu.DropDownItems.Add(convertItem);
-            ToolStripMenuItem openSeqItem = new ToolStripMenuItem("Open SEQ File...");
-            openSeqItem.Click += OpenSeqFileMenuItem_Click;
-            toolsMenu.DropDownItems.Add(openSeqItem);
             ToolStripMenuItem trimItem = new ToolStripMenuItem("Trim Videos...");
             trimItem.Click += TrimVideosMenuItem_Click;
             toolsMenu.DropDownItems.Add(trimItem);
@@ -5204,118 +5198,128 @@ namespace QueenPix
         }
         private void ToggleCameraTrigger(int cameraIndex)
         {
-            if (cameraIndex < 0 || cameraIndex >= cameras.Count) return;
+            if (cameraIndex < 0 || cameraIndex >= cameras.Count)
+                return;
+            
             var camera = cameras[cameraIndex];
-            if (!camera.IsImagingSource) return;
-
+            
             try
             {
                 if (!camera.ImagingControl.DeviceValid)
                 {
-                    MessageBox.Show("Camera is not connected.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    MessageBox.Show("Camera is not properly connected.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
-
-                bool newState = !camera.HardwareTriggerEnabled;
-                bool wasLive = camera.ImagingControl.LiveVideoRunning;
-
-                // USB3Vision cameras require trigger to be set before the stream starts.
-                // Stop → configure → restart to ensure the camera applies the new trigger state.
-                if (wasLive)
-                    camera.ImagingControl.LiveStop();
-
-                bool success = SetHardwareTrigger(camera.ImagingControl, newState);
-
-                if (wasLive)
-                    camera.ImagingControl.LiveStart();
-
-                if (success)
+                
+                if (camera.ImagingControl.VCDPropertyItems == null)
                 {
-                    camera.HardwareTriggerEnabled = newState;
-                    UpdateTriggerButtonAppearance(camera);
-                    LogCameraInfo($"Camera {cameraIndex + 1} ({camera.CustomName}): Hardware trigger → {(newState ? "ON" : "OFF")}");
+                    MessageBox.Show("Camera properties not available.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
                 }
-                else
+                
+                // Try to find and toggle trigger-related properties using the correct API
+                // Based on TIS.Imaging SDK documentation: iterate through Items -> Elements -> Interfaces
+                bool triggerToggled = false;
+                string[] triggerPropertyNames = { "Trigger", "Trigger On/Off", "TriggerMode", "TriggerSoftware", "Trigger Software", "TriggerEnable" };
+                
+                try
                 {
+                    var propertyItems = camera.ImagingControl.VCDPropertyItems;
+                    
+                    // Iterate through all VCDPropertyItems
+                    foreach (VCDPropertyItem propertyItem in propertyItems)
+                    {
+                        try
+                        {
+                            string propName = propertyItem.Name ?? "";
+                            
+                            // Check if this property name matches any trigger property
+                            bool isTriggerProperty = false;
+                            foreach (string triggerName in triggerPropertyNames)
+                            {
+                                if (propName.IndexOf(triggerName, StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    isTriggerProperty = true;
+                                    break;
+                                }
+                            }
+                            
+                            if (!isTriggerProperty) continue;
+                            
+                            // Iterate through all Elements of this property
+                            foreach (VCDPropertyElement propertyElement in propertyItem.Elements)
+                            {
+                                // Iterate through all Interfaces of this element
+                                foreach (VCDPropertyInterface propertyInterface in propertyElement)
+                                {
+                                    try
+                                    {
+                                        // Check if it's a Switch interface (on/off toggle)
+                                        if (propertyInterface.InterfaceGUID == VCDGUIDs.VCDInterface_Switch)
+                                        {
+                                            VCDSwitchProperty switchProp = (VCDSwitchProperty)propertyInterface;
+                                            if (!switchProp.ReadOnly)
+                                            {
+                                                bool currentValue = switchProp.Switch;
+                                                switchProp.Switch = !currentValue;
+                                                triggerToggled = true;
+                                                LogCameraInfo($"Camera {cameraIndex + 1}: Trigger ({propName}) toggled to {!currentValue}");
+                                                break;
+                                            }
+                                        }
+                                        // Check if it's a Button interface (execute/push)
+                                        else if (propertyInterface.InterfaceGUID == VCDGUIDs.VCDInterface_Button)
+                                        {
+                                            VCDButtonProperty buttonProp = (VCDButtonProperty)propertyInterface;
+                                            if (!buttonProp.ReadOnly)
+                                            {
+                                                buttonProp.Push();
+                                                triggerToggled = true;
+                                                LogCameraInfo($"Camera {cameraIndex + 1}: Trigger ({propName}) executed");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    catch (Exception interfaceEx)
+                                    {
+                                        LogCameraInfo($"Error accessing interface: {interfaceEx.Message}");
+                                    }
+                                }
+                                
+                                if (triggerToggled) break;
+                            }
+                            
+                            if (triggerToggled) break;
+                        }
+                        catch (Exception itemEx)
+                        {
+                            LogCameraInfo($"Error accessing property item: {itemEx.Message}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogCameraInfo($"Error accessing properties: {ex.Message}");
+                }
+                
+                if (!triggerToggled)
+                {
+                    // Fallback: Open properties dialog if we can't toggle programmatically
                     camera.ImagingControl.ShowPropertyDialog();
-                    LogCameraInfo($"Camera {cameraIndex + 1}: Could not set hardware trigger programmatically, opened properties dialog");
+                    LogCameraInfo($"Camera {cameraIndex + 1}: Could not toggle trigger programmatically, opened properties dialog");
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Error setting trigger: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                LogCameraInfo($"Error setting trigger for camera {cameraIndex + 1}: {ex.Message}");
-            }
-        }
-
-        private bool SetHardwareTrigger(ICImagingControl ic, bool enable)
-        {
-            if (!ic.DeviceValid || ic.VCDPropertyItems == null) return false;
-
-            var triggerSwitch = ic.VCDPropertyItems.Find<VCDSwitchProperty>(
-                VCDGUIDs.VCDID_TriggerMode, VCDGUIDs.VCDElement_Value);
-            if (triggerSwitch == null)
-            {
-                LogCameraInfo("Hardware trigger: enable switch not found on this camera");
-                return false;
-            }
-            if (triggerSwitch.ReadOnly)
-            {
-                LogCameraInfo("Hardware trigger: enable switch is read-only");
-                return false;
-            }
-            LogCameraInfo($"Trigger switch Available={triggerSwitch.Available}, ReadOnly={triggerSwitch.ReadOnly}, current={triggerSwitch.Switch}");
-            triggerSwitch.Switch = enable;
-            LogCameraInfo($"Hardware trigger enable → {enable} (readback: {triggerSwitch.Switch})");
-
-            if (enable)
-            {
-                // DMK23UP1300 uses VCDElement_TriggerMode (MapStrings) for cameras that support it.
-                // This camera only exposes Enable + Polarity + Delay; TriggerMode Find will return null.
-                var triggerMode = ic.VCDPropertyItems.Find<VCDMapStringsProperty>(
-                    VCDGUIDs.VCDID_TriggerMode, VCDGUIDs.VCDElement_TriggerMode);
-                if (triggerMode != null && !triggerMode.ReadOnly && triggerMode.Strings?.Length > 0)
+                MessageBox.Show($"Error toggling trigger: {ex.Message}\n\n" +
+                              "Opening properties dialog instead...",
+                              "Error", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                try
                 {
-                    LogCameraInfo($"TriggerMode options: [{string.Join(", ", triggerMode.Strings)}], current: '{triggerMode.String}'");
-                    string[] preferred = { "FixedExposure", "Fixed Exposure", "External", "Hardware" };
-                    foreach (string p in preferred)
-                    {
-                        if (((IEnumerable<string>)triggerMode.Strings).Contains(p))
-                        {
-                            triggerMode.String = p;
-                            LogCameraInfo($"TriggerMode → '{p}'");
-                            break;
-                        }
-                    }
+                    camera.ImagingControl.ShowPropertyDialog();
                 }
-
-                // Polarity on DMK23UP1300 is a boolean Switch (not MapStrings).
-                // Log the current polarity value to help diagnose edge-polarity mismatches.
-                var polaritySwitch = ic.VCDPropertyItems.Find<VCDSwitchProperty>(
-                    VCDGUIDs.VCDID_TriggerMode, VCDGUIDs.VCDElement_TriggerPolarity);
-                if (polaritySwitch != null)
-                    LogCameraInfo($"TriggerPolarity (Switch) = {polaritySwitch.Switch} (false=HighActive/RisingEdge, true=LowActive/FallingEdge)");
-                else
-                    LogCameraInfo("TriggerPolarity: not found as Switch or MapStrings (using camera default)");
-            }
-
-            return true;
-        }
-
-        private void UpdateTriggerButtonAppearance(CameraControl camera)
-        {
-            if (camera.TriggerButton == null) return;
-            if (camera.HardwareTriggerEnabled)
-            {
-                camera.TriggerButton.Text = "🔴 Trig ON";
-                camera.TriggerButton.BackColor = System.Drawing.Color.FromArgb(255, 200, 200);
-                camera.TriggerButton.ForeColor = System.Drawing.Color.DarkRed;
-            }
-            else
-            {
-                camera.TriggerButton.Text = "🔘 Trigger";
-                camera.TriggerButton.BackColor = System.Drawing.SystemColors.Control;
-                camera.TriggerButton.ForeColor = System.Drawing.SystemColors.ControlText;
+                catch { }
+                LogCameraInfo($"Error toggling trigger for camera {cameraIndex + 1}: {ex.Message}");
             }
         }
 
@@ -5471,23 +5475,8 @@ namespace QueenPix
                                     {
                                         if (cameras[i].IsImagingSource)
                                         {
-                                            // Set trigger BEFORE LiveStart for USB3Vision cameras
-                                            if (cameras[i].Settings.UseExternalTrigger)
-                                            {
-                                                try
-                                                {
-                                                    bool ok = SetHardwareTrigger(cameras[i].ImagingControl, true);
-                                                    cameras[i].HardwareTriggerEnabled = ok;
-                                                }
-                                                catch (Exception trigEx)
-                                                {
-                                                    LogCameraInfo($"Warning: could not enable hardware trigger for {cameras[i].DeviceName}: {trigEx.Message}");
-                                                }
-                                            }
-
                                             cameras[i].ImagingControl.LiveStart();
                                             cameras[i].FrameCount = 0;
-                                            UpdateTriggerButtonAppearance(cameras[i]);
                                         }
                                         else
                                         {
@@ -5629,8 +5618,8 @@ namespace QueenPix
                     }
                     else
                     {
-                        // External trigger mode — trigger enable is set just before LiveStart() in BtnStartLive_Click
-                        LogCameraInfo($"Camera {camera.DeviceName}: UseExternalTrigger=true — trigger will be enabled before LiveStart");
+                        // External trigger mode - don't set software frame rate
+                        LogCameraInfo($"Camera {camera.DeviceName}: Using EXTERNAL TRIGGER (software frame rate not applied)");
                     }
                 }
                 catch (Exception ex)
@@ -6291,32 +6280,19 @@ namespace QueenPix
                     {
                         if (camera.IsImagingSource)
                         {
-                            // Set up FrameHandlerSink for live preview to enable screenshots
+                            // Always set up a FrameHandlerSink for live preview to enable screenshots
+                            // Store the original sink (might be null) before setting up preview sink
                             camera.OriginalSink = camera.ImagingControl.Sink;
+
+                            // Create a FrameHandlerSink for live preview (same as timelapse)
                             var previewSink = new FrameHandlerSink();
                             previewSink.SnapMode = false; // Grab mode (continuous)
                             camera.ImagingControl.Sink = previewSink;
 
-                            // Set trigger state BEFORE LiveStart — USB3Vision cameras require trigger
-                            // mode to be configured before the stream starts, not after.
-                            if (camera.Settings.UseExternalTrigger)
-                            {
-                                try
-                                {
-                                    bool ok = SetHardwareTrigger(camera.ImagingControl, true);
-                                    camera.HardwareTriggerEnabled = ok;
-                                }
-                                catch (Exception trigEx)
-                                {
-                                    LogCameraInfo($"Warning: could not enable hardware trigger for {camera.DeviceName}: {trigEx.Message}");
-                                }
-                            }
-
+                            // Now start live
                             camera.ImagingControl.LiveStart();
                             camera.LastFpsUpdate = DateTime.Now;
                             camera.FrameCount = 0;
-
-                            UpdateTriggerButtonAppearance(camera);
                         }
                         else
                         {
@@ -6552,7 +6528,7 @@ namespace QueenPix
                         if (camera.ImagingControl.LiveVideoRunning)
                         {
                             ImageBuffer? imageBuffer = null;
-
+                            
                             // Method 1: active sink is FrameHandlerSink (live preview, loop, timelapse)
                             if (camera.ImagingControl.Sink is FrameHandlerSink frameHandlerSink)
                             {
@@ -9391,25 +9367,6 @@ namespace QueenPix
             catch (Exception ex)
             {
                 MessageBox.Show($"Error in conversion tool: {ex.Message}",
-                                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        private void OpenSeqFileMenuItem_Click(object? sender, EventArgs e)
-        {
-            try
-            {
-                using var ofd = new OpenFileDialog
-                {
-                    Title = "Open Norpix StreamPix SEQ File",
-                    Filter = "SEQ Files (*.seq)|*.seq|All Files (*.*)|*.*"
-                };
-                if (ofd.ShowDialog() != DialogResult.OK) return;
-                new SeqViewerDialog(ofd.FileName).ShowDialog(this);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Error opening SEQ file: {ex.Message}",
                                 "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
